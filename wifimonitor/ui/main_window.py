@@ -307,7 +307,7 @@ class MainWindow(QMainWindow):
         if last_seen_dt:
             ap["last_seen_dt"] = last_seen_dt
         self.ap_records[bssid] = {**previous, **ap}
-        self._update_access_point_row(bssid)
+        self._rebuild_access_point_table()
         self._refresh_targets()
 
     def _add_station(self, station: dict) -> None:
@@ -328,9 +328,9 @@ class MainWindow(QMainWindow):
         self.station_records[mac] = {**previous, **station}
         if bssid:
             self.clients_map[bssid].add(mac)
-        self._update_station_row(mac)
+        self._rebuild_station_table()
         if bssid:
-            self._update_access_point_row(bssid)
+            self._rebuild_access_point_table()
             self._refresh_targets()
 
     def _add_handshake(self, handshake: dict) -> None:
@@ -386,41 +386,101 @@ class MainWindow(QMainWindow):
             return ""
         return str(value)
 
-    def _update_access_point_row(self, bssid: str) -> None:
-        ap = self.ap_records.get(bssid)
-        if not ap:
-            return
-        active_clients = self._active_clients_for_ap(bssid)
-        last_seen_text = self._format_time_since(ap.get("last_seen_dt"))
-        self._update_row(self.ap_table, bssid, [
-            self._to_text(ap.get("bssid")),
-            self._to_text(ap.get("essid")),
-            self._to_text(ap.get("channel")),
-            self._to_text(ap.get("encryption")),
-            self._to_text(ap.get("signal")),
-            self._to_text(len(active_clients)),
-            last_seen_text,
-        ], prepend_index=True)
+    def _rebuild_access_point_table(self) -> None:
+        rows = sorted(
+            self.ap_records.items(),
+            key=lambda item: item[1].get("last_seen_dt") or datetime.min,
+            reverse=True,
+        )
+        self.ap_table.setRowCount(len(rows))
+        for row_idx, (bssid, ap) in enumerate(rows):
+            self._set_access_point_row(row_idx, bssid, ap)
         self._auto_resize_table(self.ap_table)
 
-    def _update_station_row(self, mac: str) -> None:
-        station = self.station_records.get(mac)
-        if not station:
-            return
-        last_seen_text = self._format_time_since(station.get("last_seen_dt"))
-        self._update_row(self.st_table, mac, [
-            self._to_text(station.get("mac")),
-            self._to_text(station.get("associated_bssid")),
-            self._to_text(station.get("signal")),
-            last_seen_text,
-        ])
+    def _rebuild_station_table(self) -> None:
+        rows = sorted(
+            self.station_records.items(),
+            key=lambda item: item[1].get("last_seen_dt") or datetime.min,
+            reverse=True,
+        )
+        self.st_table.setRowCount(len(rows))
+        for row_idx, (mac, station) in enumerate(rows):
+            self._set_station_row(row_idx, mac, station)
         self._auto_resize_table(self.st_table)
 
+    def _set_access_point_row(self, row_idx: int, bssid: str, ap: dict) -> None:
+        key_item = QTableWidgetItem(bssid)
+        key_item.setData(Qt.UserRole, bssid)
+        key_item.setFlags(key_item.flags() & ~Qt.ItemIsEditable)
+        self.ap_table.setVerticalHeaderItem(row_idx, key_item)
+
+        number_item = QTableWidgetItem(str(row_idx + 1))
+        number_item.setTextAlignment(Qt.AlignCenter)
+        number_item.setFlags(number_item.flags() & ~Qt.ItemIsEditable)
+        self.ap_table.setItem(row_idx, 0, number_item)
+
+        bssid_item = QTableWidgetItem(self._to_text(ap.get("bssid")))
+        bssid_item.setFlags(bssid_item.flags() & ~Qt.ItemIsEditable)
+        self.ap_table.setItem(row_idx, 1, bssid_item)
+
+        essid_item = QTableWidgetItem(self._to_text(ap.get("essid")))
+        essid_item.setFlags(essid_item.flags() & ~Qt.ItemIsEditable)
+        self.ap_table.setItem(row_idx, 2, essid_item)
+
+        channel_item = QTableWidgetItem(self._to_text(ap.get("channel")))
+        channel_item.setTextAlignment(Qt.AlignCenter)
+        channel_item.setFlags(channel_item.flags() & ~Qt.ItemIsEditable)
+        self.ap_table.setItem(row_idx, 3, channel_item)
+
+        encryption_item = QTableWidgetItem(self._to_text(ap.get("encryption")))
+        encryption_item.setFlags(encryption_item.flags() & ~Qt.ItemIsEditable)
+        self.ap_table.setItem(row_idx, 4, encryption_item)
+
+        signal_item = QTableWidgetItem(self._to_text(ap.get("signal")))
+        signal_item.setTextAlignment(Qt.AlignCenter)
+        signal_item.setFlags(signal_item.flags() & ~Qt.ItemIsEditable)
+        self.ap_table.setItem(row_idx, 5, signal_item)
+
+        active_clients = len(self._active_clients_for_ap(bssid))
+        clients_item = QTableWidgetItem(self._to_text(active_clients))
+        clients_item.setTextAlignment(Qt.AlignCenter)
+        clients_item.setFlags(clients_item.flags() & ~Qt.ItemIsEditable)
+        self.ap_table.setItem(row_idx, 6, clients_item)
+
+        last_seen_dt = ap.get("last_seen_dt")
+        last_seen_item = QTableWidgetItem(self._format_time_since(last_seen_dt))
+        last_seen_item.setFlags(last_seen_item.flags() & ~Qt.ItemIsEditable)
+        last_seen_item.setData(Qt.UserRole, last_seen_dt.timestamp() if last_seen_dt else float("-inf"))
+        self.ap_table.setItem(row_idx, 7, last_seen_item)
+
+    def _set_station_row(self, row_idx: int, mac: str, station: dict) -> None:
+        key_item = QTableWidgetItem(mac)
+        key_item.setData(Qt.UserRole, mac)
+        key_item.setFlags(key_item.flags() & ~Qt.ItemIsEditable)
+        self.st_table.setVerticalHeaderItem(row_idx, key_item)
+
+        mac_item = QTableWidgetItem(self._to_text(station.get("mac")))
+        mac_item.setFlags(mac_item.flags() & ~Qt.ItemIsEditable)
+        self.st_table.setItem(row_idx, 0, mac_item)
+
+        bssid_item = QTableWidgetItem(self._to_text(station.get("associated_bssid")))
+        bssid_item.setFlags(bssid_item.flags() & ~Qt.ItemIsEditable)
+        self.st_table.setItem(row_idx, 1, bssid_item)
+
+        signal_item = QTableWidgetItem(self._to_text(station.get("signal")))
+        signal_item.setTextAlignment(Qt.AlignCenter)
+        signal_item.setFlags(signal_item.flags() & ~Qt.ItemIsEditable)
+        self.st_table.setItem(row_idx, 2, signal_item)
+
+        last_seen_dt = station.get("last_seen_dt")
+        last_seen_item = QTableWidgetItem(self._format_time_since(last_seen_dt))
+        last_seen_item.setFlags(last_seen_item.flags() & ~Qt.ItemIsEditable)
+        last_seen_item.setData(Qt.UserRole, last_seen_dt.timestamp() if last_seen_dt else float("-inf"))
+        self.st_table.setItem(row_idx, 3, last_seen_item)
+
     def _refresh_relative_rows(self) -> None:
-        for bssid in list(self.ap_records.keys()):
-            self._update_access_point_row(bssid)
-        for mac in list(self.station_records.keys()):
-            self._update_station_row(mac)
+        self._rebuild_access_point_table()
+        self._rebuild_station_table()
 
     def _auto_resize_table(self, table: QTableWidget) -> None:
         if table.columnCount() == 0:

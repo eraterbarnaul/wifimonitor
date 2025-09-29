@@ -1,0 +1,3 @@
+scapy
+PyQt5
+openpyxl

@@ -1,0 +1,1 @@
+"""Wifimonitor application package."""

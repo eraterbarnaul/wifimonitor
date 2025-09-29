@@ -1,5 +1,5 @@
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
@@ -32,6 +32,8 @@ from ..controller import WifiMonitorController
 
 
 class MainWindow(QMainWindow):
+    TARGET_STALE_SECONDS = 60
+
     def __init__(self, controller: WifiMonitorController, db_path: Optional[Path] = None, capture_dir: Optional[Path] = None) -> None:
         super().__init__()
         self.controller = controller
@@ -388,7 +390,7 @@ class MainWindow(QMainWindow):
         ap = self.ap_records.get(bssid)
         if not ap:
             return
-        clients = len(self.clients_map.get(bssid, set()))
+        active_clients = self._active_clients_for_ap(bssid)
         last_seen_text = self._format_time_since(ap.get("last_seen_dt"))
         self._update_row(self.ap_table, bssid, [
             self._to_text(ap.get("bssid")),
@@ -396,7 +398,7 @@ class MainWindow(QMainWindow):
             self._to_text(ap.get("channel")),
             self._to_text(ap.get("encryption")),
             self._to_text(ap.get("signal")),
-            self._to_text(clients),
+            self._to_text(len(active_clients)),
             last_seen_text,
         ], prepend_index=True)
         self._auto_resize_table(self.ap_table)
@@ -424,6 +426,23 @@ class MainWindow(QMainWindow):
         if table.columnCount() == 0:
             return
         table.resizeColumnsToContents()
+
+    def _is_recent(self, last_seen: Optional[datetime], threshold: Optional[int] = None) -> bool:
+        if not last_seen:
+            return False
+        limit = threshold if threshold is not None else self.TARGET_STALE_SECONDS
+        return (datetime.utcnow() - last_seen) <= timedelta(seconds=limit)
+
+    def _active_clients_for_ap(self, bssid: str) -> List[str]:
+        clients = self.clients_map.get(bssid, set())
+        active: List[str] = []
+        for mac in clients:
+            station = self.station_records.get(mac)
+            if not station:
+                continue
+            if self._is_recent(station.get("last_seen_dt")):
+                active.append(mac)
+        return active
 
     def _format_time_since(self, last_seen: Optional[datetime]) -> str:
         if not last_seen:
@@ -476,7 +495,9 @@ class MainWindow(QMainWindow):
         self.target_ap_combo.blockSignals(True)
         self.target_ap_combo.clear()
         for bssid, ap in sorted(self.ap_records.items()):
-            clients = sorted(self.clients_map.get(bssid, set()))
+            if not self._is_recent(ap.get("last_seen_dt")):
+                continue
+            clients = sorted(self._active_clients_for_ap(bssid))
             if not clients:
                 continue
             essid = ap.get("essid") or bssid
@@ -501,7 +522,7 @@ class MainWindow(QMainWindow):
             self.target_client_combo.setEnabled(False)
             self.target_client_combo.blockSignals(False)
             return
-        clients = sorted(self.clients_map.get(bssid, set()))
+        clients = sorted(self._active_clients_for_ap(bssid))
         if not clients:
             self.target_client_combo.setEnabled(False)
         else:
@@ -558,7 +579,10 @@ class MainWindow(QMainWindow):
         if client_value:
             clients = [client_value]
         else:
-            clients = sorted(self.clients_map.get(bssid, set()))
+            clients = sorted(self._active_clients_for_ap(bssid))
+        if not clients:
+            self._show_error("Активные клиенты не найдены")
+            return
         try:
             self.controller.start_deauth(
                 bssid,

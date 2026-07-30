@@ -12,6 +12,8 @@ class AccessPoint:
     channel: Optional[int] = None
     encryption: Optional[str] = None
     signal: Optional[int] = None
+    wps: bool = False
+    mfp_required: bool = False
     last_seen: datetime = field(default_factory=utcnow)
 
 

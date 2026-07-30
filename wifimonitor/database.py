@@ -31,10 +31,17 @@ class DatabaseManager:
                     channel INTEGER,
                     encryption TEXT,
                     signal INTEGER,
+                    wps INTEGER DEFAULT 0,
+                    mfp_required INTEGER DEFAULT 0,
                     last_seen TEXT
                 )
                 """
             )
+            ap_columns = {row[1] for row in conn.execute("PRAGMA table_info(access_points)")}
+            if "wps" not in ap_columns:
+                conn.execute("ALTER TABLE access_points ADD COLUMN wps INTEGER DEFAULT 0")
+            if "mfp_required" not in ap_columns:
+                conn.execute("ALTER TABLE access_points ADD COLUMN mfp_required INTEGER DEFAULT 0")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS stations (
@@ -66,13 +73,15 @@ class DatabaseManager:
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO access_points (bssid, essid, channel, encryption, signal, last_seen)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO access_points (bssid, essid, channel, encryption, signal, wps, mfp_required, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(bssid) DO UPDATE SET
                     essid=excluded.essid,
                     channel=excluded.channel,
                     encryption=excluded.encryption,
                     signal=excluded.signal,
+                    wps=excluded.wps,
+                    mfp_required=excluded.mfp_required,
                     last_seen=excluded.last_seen
                 """,
                 (
@@ -81,6 +90,8 @@ class DatabaseManager:
                     ap.channel,
                     ap.encryption,
                     ap.signal,
+                    int(ap.wps),
+                    int(ap.mfp_required),
                     ap.last_seen.isoformat(),
                 ),
             )

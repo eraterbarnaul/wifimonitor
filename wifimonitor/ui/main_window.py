@@ -30,7 +30,9 @@ from PyQt5.QtWidgets import (
     QHeaderView,
 )
 
+from ..audit import assess, priority_rank
 from ..controller import WifiMonitorController
+from ..oui import lookup_vendor
 from ..timeutil import as_utc, utcnow
 from .workers import Worker
 
@@ -50,6 +52,7 @@ class MainWindow(QMainWindow):
         self.ap_records: Dict[str, dict] = {}
         self.station_records: Dict[str, dict] = {}
         self.clients_map: Dict[str, Set[str]] = defaultdict(set)
+        self._pmkid_aps: Set[str] = set()
         self.db_path = db_path
         self.capture_dir = capture_dir
         # Coalesced GUI refresh: capture callbacks only mark state dirty; the
@@ -120,8 +123,8 @@ class MainWindow(QMainWindow):
 
         splitter = QSplitter(Qt.Vertical)
 
-        self.ap_table = QTableWidget(0, 8)
-        self.ap_table.setHorizontalHeaderLabels(["№", "BSSID", "ESSID", "Канал", "Шифрование", "Сигнал", "Клиенты", "Обновлено"])
+        self.ap_table = QTableWidget(0, 9)
+        self.ap_table.setHorizontalHeaderLabels(["№", "BSSID", "ESSID", "Канал", "Шифрование", "Сигнал", "Клиенты", "Обновлено", "Оценка"])
         self.ap_table.horizontalHeader().setStretchLastSection(True)
         self.ap_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.ap_table.horizontalHeader().setSectionsClickable(True)
@@ -456,6 +459,8 @@ class MainWindow(QMainWindow):
 
     def _add_handshake(self, handshake: dict) -> None:
         kind = handshake.get("kind") or "handshake"
+        if kind == "pmkid" and handshake.get("bssid"):
+            self._pmkid_aps.add(handshake["bssid"])
         key = f"{handshake.get('bssid')}->{handshake.get('station_mac')}:{kind}"
         self._update_row(self.hs_table, key, [
             self._to_text(handshake.get("bssid")),
@@ -539,6 +544,16 @@ class MainWindow(QMainWindow):
             return signal if signal is not None else -9999
         if col == 6:
             return len(self._active_clients_for_ap(bssid))
+        if col == 8:
+            label, _ = assess(
+                ap.get("encryption"),
+                wps=bool(ap.get("wps")),
+                mfp_required=bool(ap.get("mfp_required")),
+                signal=ap.get("signal"),
+                client_count=len(self._active_clients_for_ap(bssid)),
+                has_pmkid=bssid in self._pmkid_aps,
+            )
+            return priority_rank(label)
         return ap.get("last_seen_dt") or _MIN_DT
 
     def _on_ap_header_clicked(self, col: int) -> None:
@@ -548,7 +563,7 @@ class MainWindow(QMainWindow):
             self._ap_sort_desc = not self._ap_sort_desc
         else:
             self._ap_sort_col = col
-            self._ap_sort_desc = col in (5, 6, 7)  # signal / clients / last-seen default to desc
+            self._ap_sort_desc = col in (5, 6, 7, 8)  # signal/clients/last-seen/verdict default to desc
         self._rebuild_access_point_table()
 
     def _rebuild_access_point_table(self) -> None:
@@ -611,6 +626,9 @@ class MainWindow(QMainWindow):
 
         bssid_item = QTableWidgetItem(self._to_text(ap.get("bssid")))
         bssid_item.setFlags(bssid_item.flags() & ~Qt.ItemIsEditable)
+        vendor = lookup_vendor(bssid)
+        if vendor:
+            bssid_item.setToolTip(f"Производитель: {vendor}")
         self.ap_table.setItem(row_idx, 1, bssid_item)
 
         essid_item = QTableWidgetItem(self._to_text(ap.get("essid")))
@@ -642,6 +660,20 @@ class MainWindow(QMainWindow):
         last_seen_item.setFlags(last_seen_item.flags() & ~Qt.ItemIsEditable)
         last_seen_item.setData(Qt.UserRole, last_seen_dt.timestamp() if last_seen_dt else float("-inf"))
         self.ap_table.setItem(row_idx, 7, last_seen_item)
+
+        label, detail = assess(
+            ap.get("encryption"),
+            wps=bool(ap.get("wps")),
+            mfp_required=bool(ap.get("mfp_required")),
+            signal=ap.get("signal"),
+            client_count=active_clients,
+            has_pmkid=bssid in self._pmkid_aps,
+        )
+        verdict_item = QTableWidgetItem(label)
+        verdict_item.setFlags(verdict_item.flags() & ~Qt.ItemIsEditable)
+        verdict_item.setToolTip(detail)
+        verdict_item.setData(Qt.UserRole, priority_rank(label))
+        self.ap_table.setItem(row_idx, 8, verdict_item)
 
     def _set_station_row(self, row_idx: int, mac: str, station: dict) -> None:
         key_item = QTableWidgetItem(mac)

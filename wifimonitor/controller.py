@@ -213,6 +213,8 @@ class WifiMonitorController(QObject):
                 channel=row.get("channel"),
                 encryption=row.get("encryption"),
                 signal=row.get("signal"),
+                wps=bool(row.get("wps")),
+                mfp_required=bool(row.get("mfp_required")),
                 last_seen=as_utc(datetime.fromisoformat(last_seen)) if last_seen else utcnow(),
             )
             with self._state_lock:

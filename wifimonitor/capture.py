@@ -11,7 +11,7 @@ from scapy.packet import Packet  # type: ignore
 from .hashcat import find_pmkid, parse_key_frame
 from .models import AccessPoint, Handshake, Station
 from .timeutil import utcnow
-from .wifi_ie import WPA_VENDOR_HEADER, classify_rsn, frequency_to_channel
+from .wifi_ie import WPA_VENDOR_HEADER, WPS_VENDOR_HEADER, frequency_to_channel, parse_rsn
 
 DEFAULT_CHANNELS_24GHZ = list(range(1, 14))
 DEFAULT_CHANNELS_5GHZ = [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165]
@@ -197,6 +197,8 @@ class MonitorService:
         channel = None
         ht_channel = None
         encryption = []
+        wps = False
+        mfp_required = False
         signal = getattr(packet, "dBm_AntSignal", None)
         elt = packet.getlayer(Dot11Elt)
         while elt is not None:
@@ -207,9 +209,15 @@ class MonitorService:
             elif elt.ID == 61 and elt.info:
                 ht_channel = elt.info[0]  # HT Operation: primary channel (5 GHz)
             elif elt.ID == 48:
-                encryption.append(classify_rsn(bytes(elt.info)))
-            elif elt.ID == 221 and bytes(elt.info)[:4] == WPA_VENDOR_HEADER:
-                encryption.append("WPA")
+                rsn = parse_rsn(bytes(elt.info))
+                encryption.append(str(rsn["classification"]))
+                mfp_required = mfp_required or bool(rsn["mfp_required"])
+            elif elt.ID == 221:
+                header = bytes(elt.info)[:4]
+                if header == WPA_VENDOR_HEADER:
+                    encryption.append("WPA")
+                elif header == WPS_VENDOR_HEADER:
+                    wps = True
             elt = elt.payload.getlayer(Dot11Elt)
         # DS Parameter Set (IE 3) is usually absent on 5/6 GHz; fall back to the
         # HT Operation primary channel and finally the RadioTap frequency.
@@ -227,6 +235,8 @@ class MonitorService:
             essid=essid,
             channel=channel,
             encryption="/".join(ordered) if ordered else None,
+            wps=wps,
+            mfp_required=mfp_required,
             last_seen=utcnow(),
         )
         if signal is not None:

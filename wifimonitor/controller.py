@@ -119,10 +119,12 @@ class WifiMonitorController(QObject):
         self.handshake_captured.emit(asdict(handshake))
 
     def export_hashcat(self, capture_path: Path, output_path: Path, tool_path: Optional[str] = None) -> None:
-        exporter = self.hashcat_exporter
+        # Native export (scapy parsing) by default; only shell out to
+        # hcxpcapngtool when the caller explicitly supplies a tool path.
         if tool_path:
-            exporter = HashcatExporter(tool_path=tool_path)
-        exporter.export(capture_path, output_path)
+            HashcatExporter(tool_path=tool_path).export_with_tool(capture_path, output_path)
+        else:
+            self.hashcat_exporter.export(capture_path, output_path)
 
     def export_excel(self, output_path: Path) -> None:
         access_points = [dict(row) for row in self.db.fetch_access_points()]

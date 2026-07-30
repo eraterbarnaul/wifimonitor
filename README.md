@@ -6,14 +6,14 @@ Wifimonitor — десктопное приложение на PyQt5 для па
 - обнаружение и слежение за точками доступа (BSSID, ESSID, канал, шифрование, RSSI) и клиентами;
 - непрерывный захват EAPOL кадров с сохранением в pcap и базу SQLite;
 - выбор цели для деаутентификации, поддержка отдельного клиента либо всех клиентов точки;
-- экспорт данных в `*.xlsx` и хешей в `*.hc22000` при наличии `hcxpcapngtool`;
+- экспорт данных в `*.xlsx` и хешей в `*.hc22000` (нативно, включая PMKID; `hcxpcapngtool` не требуется);
 - автоматическое переключение по каналам для охвата диапазонов 2.4/5 ГГц;
 - просмотр оперативных логов (сканирование, handshakes, deauth‑циклы) прямо в интерфейсе.
 
 ## Установка
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-venv python3-pip aircrack-ng iw hcxtools
+sudo apt install -y python3 python3-venv python3-pip aircrack-ng iw
 
 python3 -m venv .venv
 source .venv/bin/activate
@@ -21,8 +21,9 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-> `hcxtools` (утилита `hcxpcapngtool`) нужен только для экспорта в формат Hashcat.
-> Мониторинг и деаутентификация работают и без него.
+> Экспорт в формат Hashcat выполняется нативно (парсинг pcap средствами scapy),
+> поэтому `hcxtools` не обязателен. Установите его (`sudo apt install hcxtools`),
+> только если хотите пользоваться внешним `hcxpcapngtool`.
 
 ## Запуск
 ```bash

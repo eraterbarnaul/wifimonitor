@@ -32,6 +32,7 @@ from PyQt5.QtWidgets import (
 
 from ..audit import assess, priority_rank
 from ..controller import WifiMonitorController
+from ..detect import find_evil_twins
 from ..oui import lookup_vendor
 from ..timeutil import as_utc, utcnow
 from .workers import Worker
@@ -54,6 +55,7 @@ class MainWindow(QMainWindow):
         self.station_records: Dict[str, dict] = {}
         self.clients_map: Dict[str, Set[str]] = defaultdict(set)
         self._pmkid_aps: Set[str] = set()
+        self._reported_twins: Set[str] = set()
         self._auto_capture_bssid: Optional[str] = None
         self.db_path = db_path
         self.capture_dir = capture_dir
@@ -278,6 +280,7 @@ class MainWindow(QMainWindow):
         self.controller.interface_list_changed.connect(self._populate_interfaces)
         self.controller.deauth_state_changed.connect(self._on_deauth_state)
         self.controller.log_generated.connect(self._append_log)
+        self.controller.security_alert.connect(self._on_security_alert)
 
     def _populate_from_db(self) -> None:
         for ap in self.controller.load_access_points():
@@ -741,6 +744,19 @@ class MainWindow(QMainWindow):
         if self._targets_dirty:
             self._refresh_targets()
             self._targets_dirty = False
+        self._check_evil_twins()
+
+    def _on_security_alert(self, message: str) -> None:
+        self.status_bar.showMessage(f"⚠ {message}", 10000)
+
+    def _check_evil_twins(self) -> None:
+        twins = find_evil_twins(self.ap_records.values())
+        for essid, bssids in twins.items():
+            if essid not in self._reported_twins:
+                self._reported_twins.add(essid)
+                self._append_log(
+                    f"[ВНИМАНИЕ] Возможный evil-twin: ESSID «{essid}» на {len(bssids)} BSSID"
+                )
 
     def _auto_resize_table(self, table: QTableWidget) -> None:
         if table.columnCount() == 0:

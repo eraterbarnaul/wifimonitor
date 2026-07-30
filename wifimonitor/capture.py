@@ -5,9 +5,20 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
-from scapy.all import Dot11, Dot11Beacon, Dot11Elt, Dot11ProbeResp, EAPOL, sniff, wrpcap  # type: ignore
+from scapy.all import (  # type: ignore
+    Dot11,
+    Dot11Beacon,
+    Dot11Deauth,
+    Dot11Disas,
+    Dot11Elt,
+    Dot11ProbeResp,
+    EAPOL,
+    sniff,
+    wrpcap,
+)
 from scapy.packet import Packet  # type: ignore
 
+from .detect import DeauthFloodDetector
 from .hashcat import capture_quality, find_pmkid, parse_key_frame
 from .models import AccessPoint, Handshake, Station
 from .timeutil import utcnow
@@ -97,12 +108,15 @@ class MonitorService:
         channel_hop_interval: float = 0.5,
         enable_channel_hopper: bool = True,
         on_log: Optional[Callable[[str], None]] = None,
+        on_alert: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.interface = interface
         self.capture_dir = capture_dir
         self.on_access_point = on_access_point
         self.on_station = on_station
         self.on_handshake = on_handshake
+        self.on_alert = on_alert
+        self._deauth_detector = DeauthFloodDetector()
         self._thread: Optional[threading.Thread] = None
         self._running = threading.Event()
         self.capture_dir.mkdir(parents=True, exist_ok=True)
@@ -189,6 +203,10 @@ class MonitorService:
                     self._log(f"Обнаружен клиент {station.mac} (BSSID {label})")
         if packet.haslayer(EAPOL):
             self._process_handshake(packet, bssid)
+        if packet.haslayer(Dot11Deauth) or packet.haslayer(Dot11Disas):
+            alert = self._deauth_detector.add(time.time())
+            if alert and self.on_alert:
+                self.on_alert(alert)
 
     def _parse_access_point(self, packet, bssid: Optional[str]) -> Optional[AccessPoint]:
         if not bssid:

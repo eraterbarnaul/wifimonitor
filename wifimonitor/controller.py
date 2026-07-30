@@ -29,6 +29,7 @@ class WifiMonitorController(QObject):
     interface_list_changed = pyqtSignal(list)
     deauth_state_changed = pyqtSignal(bool)
     log_generated = pyqtSignal(str)
+    security_alert = pyqtSignal(str)
 
     def __init__(self, db_path: Path, capture_dir: Path) -> None:
         super().__init__()
@@ -83,6 +84,7 @@ class WifiMonitorController(QObject):
             on_station=self._handle_station,
             on_handshake=self._handle_handshake,
             on_log=self._log,
+            on_alert=self._handle_alert,
         )
         self.monitor_service.start()
         self.status_changed.emit("Захват запущен")
@@ -120,6 +122,13 @@ class WifiMonitorController(QObject):
     def _handle_handshake(self, handshake: Handshake) -> None:
         self.db.add_handshake(handshake)
         self.handshake_captured.emit(asdict(handshake))
+
+    def _handle_alert(self, message: str) -> None:
+        # Suppress alerts triggered by our own deauth activity.
+        if self.deauth_service and self.deauth_service.is_running():
+            return
+        self._log(f"[ВНИМАНИЕ] {message}")
+        self.security_alert.emit(message)
 
     def export_hashcat(self, capture_path: Path, output_path: Path, tool_path: Optional[str] = None) -> None:
         # Native export (scapy parsing) by default; only shell out to

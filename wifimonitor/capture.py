@@ -8,7 +8,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 from scapy.all import Dot11, Dot11Beacon, Dot11Elt, Dot11ProbeResp, EAPOL, sniff, wrpcap  # type: ignore
 from scapy.packet import Packet  # type: ignore
 
-from .hashcat import find_pmkid, parse_key_frame
+from .hashcat import capture_quality, find_pmkid, parse_key_frame
 from .models import AccessPoint, Handshake, Station
 from .timeutil import utcnow
 from .wifi_ie import WPA_VENDOR_HEADER, WPS_VENDOR_HEADER, frequency_to_channel, parse_rsn
@@ -272,8 +272,15 @@ class MonitorService:
                     f"Получен EAPOL кадр #{len(buffer)} {arrow} {msg_label} ack={'Y' if info[1] else 'N'} mic={'Y' if info[3] else 'N'} secure={'Y' if info[4] else 'N'}"
                 )
         if self._is_complete_handshake(buffer):
+            ap_msgs, sta_msgs = self._message_sets(buffer)
+            quality = capture_quality(ap_msgs | sta_msgs)
             capture_path = self._write_handshake(key, buffer)
-            handshake = Handshake(bssid=bssid, station_mac=station_mac, capture_path=str(capture_path))
+            handshake = Handshake(
+                bssid=bssid,
+                station_mac=station_mac,
+                capture_path=str(capture_path),
+                quality=quality,
+            )
             if self.on_handshake:
                 self.on_handshake(handshake)
             if self._log:
@@ -303,6 +310,7 @@ class MonitorService:
             station_mac=station_mac,
             capture_path=str(capture_path),
             kind="pmkid",
+            quality="crackable (PMKID)",
         )
         if self.on_handshake:
             self.on_handshake(handshake)
@@ -342,7 +350,7 @@ class MonitorService:
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    def _is_complete_handshake(self, packets: List[Packet]) -> bool:
+    def _message_sets(self, packets: List[Packet]) -> Tuple[Set[int], Set[int]]:
         ap_msgs: Set[int] = set()
         sta_msgs: Set[int] = set()
         for pkt in packets:
@@ -360,11 +368,13 @@ class MonitorService:
                 ap_msgs.add(msg)
             else:
                 sta_msgs.add(msg)
-        if 3 in ap_msgs and 2 in sta_msgs:
-            return True
-        if 3 in ap_msgs and 4 in sta_msgs:
-            return True
-        return False
+        return ap_msgs, sta_msgs
+
+    def _is_complete_handshake(self, packets: List[Packet]) -> bool:
+        ap_msgs, sta_msgs = self._message_sets(packets)
+        # A crackable capture needs M2 (SNONCE+MIC from the station) plus an
+        # ANONCE source (M1 or M3 from the AP). M3+M4 alone is not exportable.
+        return 2 in sta_msgs and (1 in ap_msgs or 3 in ap_msgs)
 
     def _parse_eapol_key_info(self, eapol: Packet) -> Optional[Tuple[int, bool, bool, bool, bool, int]]:
         raw = bytes(eapol)

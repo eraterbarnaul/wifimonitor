@@ -80,6 +80,24 @@ def parse_key_frame(raw: bytes) -> Optional[KeyFrame]:
     )
 
 
+def capture_quality(messages: set, has_pmkid: bool = False) -> str:
+    """Rate how usable a capture is for cracking, from the observed messages.
+
+    ``messages`` is the set of 4-way-handshake message numbers (1..4) seen for
+    a station. A crackable EAPOL pair needs M2 (SNONCE+MIC) plus an ANONCE
+    source (M1 or M3).
+    """
+    if has_pmkid:
+        return "crackable (PMKID)"
+    if 2 in messages and (1 in messages or 3 in messages):
+        return "crackable"
+    if 2 in messages:
+        return "partial (нет ANONCE)"
+    if messages:
+        return "partial"
+    return "none"
+
+
 def find_pmkid(key_data: bytes) -> Optional[bytes]:
     """Return the 16-byte PMKID from an M1 key-data blob, or ``None``."""
     i = 0

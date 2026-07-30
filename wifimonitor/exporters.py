@@ -97,12 +97,13 @@ class ExcelExporter:
             ])
 
         ws_handshakes = workbook.create_sheet("Handshakes")
-        ws_handshakes.append(["BSSID", "Station", "Type", "Capture Path", "Created At"])
+        ws_handshakes.append(["BSSID", "Station", "Type", "Quality", "Capture Path", "Created At"])
         for handshake in handshakes:
             ws_handshakes.append([
                 handshake.get("bssid"),
                 handshake.get("station_mac"),
                 handshake.get("kind"),
+                handshake.get("quality"),
                 handshake.get("capture_path"),
                 handshake.get("created_at"),
             ])

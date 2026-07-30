@@ -2,6 +2,7 @@
 
 from wifimonitor.hashcat import (
     build_hash_lines,
+    capture_quality,
     find_pmkid,
     message_number,
     parse_key_frame,
@@ -123,3 +124,12 @@ def test_build_lines_m2_m3_without_m1():
 
 def test_build_lines_empty_without_usable_frames():
     assert build_hash_lines([], ESSID) == []
+
+
+def test_capture_quality():
+    assert capture_quality(set(), has_pmkid=True) == "crackable (PMKID)"
+    assert capture_quality({1, 2}) == "crackable"
+    assert capture_quality({2, 3}) == "crackable"
+    assert capture_quality({2}) == "partial (нет ANONCE)"
+    assert capture_quality({3, 4}) == "partial"       # no M2 -> not exportable
+    assert capture_quality(set()) == "none"

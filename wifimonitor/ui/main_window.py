@@ -198,8 +198,8 @@ class MainWindow(QMainWindow):
 
         handshake_group = QGroupBox("Пойманные handshakes")
         handshake_group_layout = QVBoxLayout()
-        self.hs_table = QTableWidget(0, 5)
-        self.hs_table.setHorizontalHeaderLabels(["BSSID", "Клиент", "Тип", "Файл", "Создан"])
+        self.hs_table = QTableWidget(0, 6)
+        self.hs_table.setHorizontalHeaderLabels(["BSSID", "Клиент", "Тип", "Файл", "Создан", "Качество"])
         self.hs_table.horizontalHeader().setStretchLastSection(True)
         self.hs_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         font = QFont("Fira Code", 10)
@@ -497,6 +497,7 @@ class MainWindow(QMainWindow):
             self._to_text(kind),
             self._to_text(handshake.get("capture_path")),
             self._to_text(handshake.get("created_at")),
+            self._to_text(handshake.get("quality")),
         ])
         self._auto_resize_table(self.hs_table)
         if self._auto_capture_bssid and handshake.get("bssid") == self._auto_capture_bssid:

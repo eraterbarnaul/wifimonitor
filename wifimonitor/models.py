@@ -31,4 +31,5 @@ class Handshake:
     station_mac: str
     capture_path: str
     kind: str = "handshake"  # "handshake" (4-way EAPOL) or "pmkid"
+    quality: str = ""  # crackable / partial / ...
     created_at: datetime = field(default_factory=utcnow)

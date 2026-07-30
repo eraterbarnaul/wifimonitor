@@ -122,12 +122,14 @@ def build_html_report(
 
     parts.append("<h2>Захваты</h2>")
     parts.append(
-        "<table><tr><th>Тип</th><th>BSSID</th><th>Клиент</th><th>Файл</th><th>Создан</th></tr>"
+        "<table><tr><th>Тип</th><th>Качество</th><th>BSSID</th><th>Клиент</th>"
+        "<th>Файл</th><th>Создан</th></tr>"
     )
     for hs in handshakes:
         parts.append(
             "<tr>"
             f"<td>{_cell(hs.get('kind') or 'handshake')}</td>"
+            f"<td>{_cell(hs.get('quality'))}</td>"
             f"<td>{_cell(hs.get('bssid'))}</td>"
             f"<td>{_cell(hs.get('station_mac'))}</td>"
             f"<td>{_cell(hs.get('capture_path'))}</td>"

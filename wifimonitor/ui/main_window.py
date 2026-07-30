@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
-from PyQt5.QtCore import Qt, QThreadPool, QTimer
+from PyQt5.QtCore import Qt, QSettings, QThreadPool, QTimer
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QAbstractItemView,
@@ -57,10 +57,12 @@ class MainWindow(QMainWindow):
         self._capture_running = False
         self._pool = QThreadPool.globalInstance()
         self._active_workers: Set[Worker] = set()
+        self._settings = QSettings("wifimonitor", "wifimonitor")
         self._setup_ui()
         self._connect_signals()
         self._populate_from_db()
         self._on_deauth_state(False)
+        self._restore_settings()
         self.controller.refresh_interfaces()
         self._announce_storage()
         self._relative_timer = QTimer(self)
@@ -261,6 +263,7 @@ class MainWindow(QMainWindow):
             self._show_error("Укажите интерфейс")
             return
         self.controller.set_interface(interface)
+        self._save_settings()
         self.status_bar.showMessage(f"Выбран интерфейс {interface}")
 
     def _run_async(self, fn, *, busy=None, on_success=None, on_error=None) -> None:
@@ -774,6 +777,7 @@ class MainWindow(QMainWindow):
         )
         if reply != QMessageBox.Yes:
             return
+        self._save_settings()
         try:
             self.controller.start_deauth(
                 bssid,
@@ -804,8 +808,25 @@ class MainWindow(QMainWindow):
     def _show_error(self, message: str) -> None:
         QMessageBox.critical(self, "Ошибка", message)
 
+    def _restore_settings(self) -> None:
+        iface = self._settings.value("interface", "", type=str)
+        if iface:
+            self.interface_combo.setEditText(iface)
+        self.deauth_count_spin.setValue(
+            self._settings.value("deauth/count", self.deauth_count_spin.value(), type=int)
+        )
+        self.deauth_interval_spin.setValue(
+            self._settings.value("deauth/interval", self.deauth_interval_spin.value(), type=float)
+        )
+
+    def _save_settings(self) -> None:
+        self._settings.setValue("interface", self.interface_combo.currentText().strip())
+        self._settings.setValue("deauth/count", self.deauth_count_spin.value())
+        self._settings.setValue("deauth/interval", self.deauth_interval_spin.value())
+
     def closeEvent(self, event) -> None:  # type: ignore
         try:
+            self._save_settings()
             self.controller.stop_capture()
         finally:
             super().closeEvent(event)

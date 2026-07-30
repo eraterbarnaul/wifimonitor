@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 from typing import Optional, Tuple
 
+from PyQt5.QtCore import QSettings
 from PyQt5.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 if __package__ in (None, ""):
@@ -19,7 +20,9 @@ else:
 
 def _select_storage(default_dir: Path) -> Optional[Tuple[Path, Path]]:
     default_dir.mkdir(parents=True, exist_ok=True)
-    db_suggest = default_dir / "wifimonitor.db"
+    settings = QSettings("wifimonitor", "wifimonitor")
+    last_db = settings.value("storage/db", "", type=str)
+    db_suggest = Path(last_db) if last_db else default_dir / "wifimonitor.db"
     db_path_str, _ = QFileDialog.getSaveFileName(
         None,
         "Выберите или создайте базу данных",
@@ -31,16 +34,20 @@ def _select_storage(default_dir: Path) -> Optional[Tuple[Path, Path]]:
     db_path = Path(db_path_str).expanduser().resolve()
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
+    last_captures = settings.value("storage/captures", str(db_path.parent), type=str)
     capture_dir_str = QFileDialog.getExistingDirectory(
         None,
         "Выберите каталог для сохранения захватов",
-        str(db_path.parent),
+        last_captures,
     )
     if capture_dir_str:
         capture_dir = Path(capture_dir_str).expanduser().resolve()
     else:
         capture_dir = db_path.parent / "captures"
     capture_dir.mkdir(parents=True, exist_ok=True)
+
+    settings.setValue("storage/db", str(db_path))
+    settings.setValue("storage/captures", str(capture_dir))
     return db_path, capture_dir
 
 

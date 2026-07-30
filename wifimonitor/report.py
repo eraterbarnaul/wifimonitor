@@ -13,7 +13,7 @@ from html import escape
 from typing import Optional, Sequence
 
 from .audit import assess
-from .oui import lookup_vendor
+from .oui import is_randomized_mac, lookup_vendor
 
 _VERDICT_CLASS = {
     "Открытая": "v-crit",
@@ -46,6 +46,7 @@ def build_html_report(
     stations: Sequence[dict],
     handshakes: Sequence[dict],
     generated_at: Optional[datetime] = None,
+    probes: Optional[dict] = None,
 ) -> str:
     generated_at = generated_at or datetime.now(timezone.utc)
     clients_by_ap: defaultdict = defaultdict(int)
@@ -105,20 +106,34 @@ def build_html_report(
 
     parts.append("<h2>Клиенты</h2>")
     parts.append(
-        "<table><tr><th>MAC</th><th>Производитель</th><th>Точка доступа</th>"
-        "<th>Сигнал</th><th>Обновлено</th></tr>"
+        "<table><tr><th>MAC</th><th>Производитель</th><th>MAC рандомизирован</th>"
+        "<th>Точка доступа</th><th>Сигнал</th><th>Обновлено</th></tr>"
     )
     for station in stations:
+        mac = station.get("mac")
         parts.append(
             "<tr>"
-            f"<td>{_cell(station.get('mac'))}</td>"
-            f"<td>{_cell(lookup_vendor(station.get('mac')))}</td>"
+            f"<td>{_cell(mac)}</td>"
+            f"<td>{_cell(lookup_vendor(mac))}</td>"
+            f"<td>{'да' if is_randomized_mac(mac) else ''}</td>"
             f"<td>{_cell(station.get('associated_bssid'))}</td>"
             f"<td>{_cell(station.get('signal'))}</td>"
             f"<td>{_cell(station.get('last_seen'))}</td>"
             "</tr>"
         )
     parts.append("</table>")
+
+    if probes:
+        parts.append("<h2>Probe requests (искомые сети)</h2>")
+        parts.append("<table><tr><th>Клиент</th><th>Запрошенные SSID</th></tr>")
+        for mac, ssids in sorted(probes.items()):
+            parts.append(
+                "<tr>"
+                f"<td>{_cell(mac)}</td>"
+                f"<td>{_cell(', '.join(ssids))}</td>"
+                "</tr>"
+            )
+        parts.append("</table>")
 
     parts.append("<h2>Захваты</h2>")
     parts.append(

@@ -35,7 +35,7 @@ from PyQt5.QtWidgets import (
 from ..audit import assess, priority_rank
 from ..controller import WifiMonitorController
 from ..detect import find_evil_twins
-from ..oui import lookup_vendor
+from ..oui import is_randomized_mac, lookup_vendor
 from ..timeutil import as_utc, utcnow
 from .locator import RssiPlot
 from .workers import Worker
@@ -61,6 +61,7 @@ class MainWindow(QMainWindow):
         self._reported_twins: Set[str] = set()
         self._rssi_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=300))
         self._locator_keys: List[str] = []
+        self._pnl: Dict[str, Set[str]] = defaultdict(set)
         self._auto_capture_bssid: Optional[str] = None
         self.db_path = db_path
         self.capture_dir = capture_dir
@@ -320,6 +321,7 @@ class MainWindow(QMainWindow):
         self.controller.deauth_state_changed.connect(self._on_deauth_state)
         self.controller.log_generated.connect(self._append_log)
         self.controller.security_alert.connect(self._on_security_alert)
+        self.controller.probe_discovered.connect(self._on_probe)
 
     def _populate_from_db(self) -> None:
         for ap in self.controller.load_access_points():
@@ -759,6 +761,17 @@ class MainWindow(QMainWindow):
 
         mac_item = QTableWidgetItem(self._to_text(station.get("mac")))
         mac_item.setFlags(mac_item.flags() & ~Qt.ItemIsEditable)
+        tips = []
+        vendor = lookup_vendor(mac)
+        if vendor:
+            tips.append(f"Производитель: {vendor}")
+        if is_randomized_mac(mac):
+            tips.append("MAC рандомизирован")
+        pnl = sorted(self._pnl.get(mac, ()))
+        if pnl:
+            tips.append("Ищет сети: " + ", ".join(pnl))
+        if tips:
+            mac_item.setToolTip("\n".join(tips))
         self.st_table.setItem(row_idx, 0, mac_item)
 
         bssid_item = QTableWidgetItem(self._to_text(station.get("associated_bssid")))
@@ -790,6 +803,12 @@ class MainWindow(QMainWindow):
 
     def _on_security_alert(self, message: str) -> None:
         self.status_bar.showMessage(f"⚠ {message}", 10000)
+
+    def _on_probe(self, info: dict) -> None:
+        mac = info.get("mac")
+        ssid = info.get("ssid")
+        if mac and ssid:
+            self._pnl[mac].add(ssid)
 
     def _record_rssi(self, key: str, signal) -> None:
         if not key or signal is None:

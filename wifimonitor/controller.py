@@ -30,6 +30,7 @@ class WifiMonitorController(QObject):
     deauth_state_changed = pyqtSignal(bool)
     log_generated = pyqtSignal(str)
     security_alert = pyqtSignal(str)
+    probe_discovered = pyqtSignal(dict)
 
     def __init__(self, db_path: Path, capture_dir: Path) -> None:
         super().__init__()
@@ -44,6 +45,7 @@ class WifiMonitorController(QObject):
         self.base_interface: Optional[str] = None
         self.access_points: Dict[str, AccessPoint] = {}
         self.clients_by_ap: Dict[str, Set[str]] = defaultdict(set)
+        self.probes_by_client: Dict[str, Set[str]] = defaultdict(set)
         # access_points / clients_by_ap are written from the sniff thread and
         # read from the GUI thread, so all access goes through this lock.
         self._state_lock = threading.Lock()
@@ -85,6 +87,8 @@ class WifiMonitorController(QObject):
             on_handshake=self._handle_handshake,
             on_log=self._log,
             on_alert=self._handle_alert,
+            on_probe=self._handle_probe,
+            on_ssid_reveal=self._handle_ssid_reveal,
         )
         self.monitor_service.start()
         self.status_changed.emit("Захват запущен")
@@ -130,6 +134,22 @@ class WifiMonitorController(QObject):
         self._log(f"[ВНИМАНИЕ] {message}")
         self.security_alert.emit(message)
 
+    def _handle_probe(self, mac: str, ssid: str) -> None:
+        with self._state_lock:
+            self.probes_by_client[mac].add(ssid)
+        self.probe_discovered.emit({"mac": mac, "ssid": ssid})
+
+    def _handle_ssid_reveal(self, bssid: str, ssid: str) -> None:
+        with self._state_lock:
+            ap = self.access_points.get(bssid)
+            reveal = ap is not None and not ap.essid
+            if reveal:
+                ap.essid = ssid
+        if reveal:
+            self.db.upsert_access_point(ap)
+            self.access_point_discovered.emit(asdict(ap))
+            self._log(f"Раскрыт скрытый SSID: {ssid} ({bssid})")
+
     def export_hashcat(self, capture_path: Path, output_path: Path, tool_path: Optional[str] = None) -> None:
         # Native export (scapy parsing) by default; only shell out to
         # hcxpcapngtool when the caller explicitly supplies a tool path.
@@ -155,7 +175,9 @@ class WifiMonitorController(QObject):
         access_points = [dict(row) for row in self.db.fetch_access_points()]
         stations = [dict(row) for row in self.db.fetch_stations()]
         handshakes = [dict(row) for row in self.db.fetch_handshakes()]
-        html = build_html_report(access_points, stations, handshakes)
+        with self._state_lock:
+            probes = {mac: sorted(ssids) for mac, ssids in self.probes_by_client.items()}
+        html = build_html_report(access_points, stations, handshakes, probes=probes)
         Path(output_path).write_text(html, encoding="utf-8")
 
 

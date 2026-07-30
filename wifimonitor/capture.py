@@ -7,11 +7,14 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from scapy.all import (  # type: ignore
     Dot11,
+    Dot11AssoReq,
     Dot11Beacon,
     Dot11Deauth,
     Dot11Disas,
     Dot11Elt,
+    Dot11ProbeReq,
     Dot11ProbeResp,
+    Dot11ReassoReq,
     EAPOL,
     sniff,
     wrpcap,
@@ -109,6 +112,8 @@ class MonitorService:
         enable_channel_hopper: bool = True,
         on_log: Optional[Callable[[str], None]] = None,
         on_alert: Optional[Callable[[str], None]] = None,
+        on_probe: Optional[Callable[[str, str], None]] = None,
+        on_ssid_reveal: Optional[Callable[[str, str], None]] = None,
     ) -> None:
         self.interface = interface
         self.capture_dir = capture_dir
@@ -116,6 +121,8 @@ class MonitorService:
         self.on_station = on_station
         self.on_handshake = on_handshake
         self.on_alert = on_alert
+        self.on_probe = on_probe
+        self.on_ssid_reveal = on_ssid_reveal
         self._deauth_detector = DeauthFloodDetector()
         self._thread: Optional[threading.Thread] = None
         self._running = threading.Event()
@@ -207,6 +214,40 @@ class MonitorService:
             alert = self._deauth_detector.add(time.time())
             if alert and self.on_alert:
                 self.on_alert(alert)
+        if packet.haslayer(Dot11ProbeReq):
+            self._handle_probe_request(packet)
+        elif packet.haslayer(Dot11AssoReq) or packet.haslayer(Dot11ReassoReq):
+            ssid = self._extract_ssid(packet)
+            if ssid and bssid and self.on_ssid_reveal:
+                self.on_ssid_reveal(bssid, ssid)
+
+    def _extract_ssid(self, packet) -> Optional[str]:
+        elt = packet.getlayer(Dot11Elt)
+        while elt is not None:
+            if elt.ID == 0:
+                try:
+                    return elt.info.decode(errors="ignore") or None
+                except Exception:  # noqa: BLE001
+                    return None
+            elt = elt.payload.getlayer(Dot11Elt)
+        return None
+
+    def _handle_probe_request(self, packet) -> None:
+        dot11 = packet[Dot11]
+        client = dot11.addr2
+        if not client:
+            return
+        # A probe-only client isn't associated to any BSSID yet, but is still
+        # worth surfacing (and useful for the locator).
+        station = Station(mac=client, associated_bssid=None, last_seen=utcnow())
+        signal = getattr(packet, "dBm_AntSignal", None)
+        if signal is not None:
+            station.signal = int(signal)
+        if self.on_station:
+            self.on_station(station)
+        ssid = self._extract_ssid(packet)
+        if ssid and self.on_probe:
+            self.on_probe(client, ssid)
 
     def _parse_access_point(self, packet, bssid: Optional[str]) -> Optional[AccessPoint]:
         if not bssid:

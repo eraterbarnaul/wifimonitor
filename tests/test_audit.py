@@ -1,7 +1,7 @@
 """Unit tests for the attackability assessment, MFP parsing and OUI lookup."""
 
 from wifimonitor.audit import assess, priority_rank
-from wifimonitor.oui import lookup_vendor
+from wifimonitor.oui import is_randomized_mac, lookup_vendor
 from wifimonitor.wifi_ie import parse_rsn
 
 
@@ -74,3 +74,11 @@ def test_oui_lookup():
     assert lookup_vendor("00-0C-29-aa-bb-cc") == "VMware"
     assert lookup_vendor("FF:FF:FF:00:00:00") == ""
     assert lookup_vendor(None) == ""
+
+
+def test_is_randomized_mac():
+    assert is_randomized_mac("DE:AD:BE:EF:00:01") is True   # 0xDE has bit 0x02
+    assert is_randomized_mac("B8:27:EB:00:00:01") is False  # real Raspberry Pi OUI
+    assert is_randomized_mac("02:11:22:33:44:55") is True
+    assert is_randomized_mac(None) is False
+    assert is_randomized_mac("") is False

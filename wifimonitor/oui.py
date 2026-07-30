@@ -48,6 +48,20 @@ def lookup_vendor(mac: Optional[str]) -> str:
     return _TABLE.get(prefix, "")
 
 
+def is_randomized_mac(mac: Optional[str]) -> bool:
+    """True if the MAC has the locally-administered bit set (randomized)."""
+    if not mac:
+        return False
+    hexmac = mac.replace(":", "").replace("-", "")
+    if len(hexmac) < 2:
+        return False
+    try:
+        first_octet = int(hexmac[:2], 16)
+    except ValueError:
+        return False
+    return bool(first_octet & 0x02)
+
+
 def load_oui_file(path: Path) -> int:
     """Merge an IEEE ``oui.txt``/``manuf``-style file into the lookup table.
 

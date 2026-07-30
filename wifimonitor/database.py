@@ -52,10 +52,15 @@ class DatabaseManager:
                     bssid TEXT,
                     station_mac TEXT,
                     capture_path TEXT,
+                    kind TEXT DEFAULT 'handshake',
                     created_at TEXT
                 )
                 """
             )
+            # Migrate databases created before the `kind` column existed.
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(handshakes)")}
+            if "kind" not in columns:
+                conn.execute("ALTER TABLE handshakes ADD COLUMN kind TEXT DEFAULT 'handshake'")
 
     def upsert_access_point(self, ap: AccessPoint) -> None:
         with self._connect() as conn:
@@ -103,13 +108,14 @@ class DatabaseManager:
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO handshakes (bssid, station_mac, capture_path, created_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO handshakes (bssid, station_mac, capture_path, kind, created_at)
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 (
                     handshake.bssid,
                     handshake.station_mac,
                     handshake.capture_path,
+                    handshake.kind,
                     handshake.created_at.isoformat(),
                 ),
             )

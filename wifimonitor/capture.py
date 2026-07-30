@@ -8,6 +8,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 from scapy.all import Dot11, Dot11Beacon, Dot11Elt, Dot11ProbeResp, EAPOL, sniff, wrpcap  # type: ignore
 from scapy.packet import Packet  # type: ignore
 
+from .hashcat import find_pmkid, parse_key_frame
 from .models import AccessPoint, Handshake, Station
 from .timeutil import utcnow
 from .wifi_ie import WPA_VENDOR_HEADER, classify_rsn, frequency_to_channel
@@ -113,6 +114,7 @@ class MonitorService:
         self._log = on_log
         self._seen_access_points: Set[str] = set()
         self._seen_stations: Set[str] = set()
+        self._seen_pmkids: Set[Tuple[str, str]] = set()
         self._locked_channel: Optional[int] = None
         self._last_beacon: Dict[str, Packet] = {}
 
@@ -245,6 +247,7 @@ class MonitorService:
             station_mac = transmitter
         if not station_mac:
             return
+        self._maybe_capture_pmkid(packet, bssid, station_mac)
         key = (bssid, station_mac)
         buffer = self._handshake_buffers[key]
         buffer.append(packet)
@@ -268,6 +271,33 @@ class MonitorService:
                     f"Сохранён handshake для {bssid} ⇄ {station_mac}: {capture_path.name}"
                 )
             self._handshake_buffers.pop(key, None)
+
+    def _maybe_capture_pmkid(self, packet, bssid: str, station_mac: str) -> None:
+        key = (bssid, station_mac)
+        if key in self._seen_pmkids:
+            return
+        try:
+            raw = bytes(packet.getlayer(EAPOL))
+        except Exception:  # noqa: BLE001 - malformed frame, nothing to extract
+            return
+        frame = parse_key_frame(raw)
+        if frame is None or frame.message != 1:
+            return
+        pmkid = find_pmkid(frame.key_data)
+        if not pmkid:
+            return
+        self._seen_pmkids.add(key)
+        capture_path = self._write_handshake(key, [packet], label="pmkid")
+        handshake = Handshake(
+            bssid=bssid,
+            station_mac=station_mac,
+            capture_path=str(capture_path),
+            kind="pmkid",
+        )
+        if self.on_handshake:
+            self.on_handshake(handshake)
+        if self._log:
+            self._log(f"Получен PMKID для {bssid} ⇄ {station_mac}: {capture_path.name}")
 
     def lock_channel(self, channel: int) -> bool:
         if channel <= 0:
@@ -345,9 +375,9 @@ class MonitorService:
             msg = 0
         return key_info, ack, install, mic, secure, msg
 
-    def _write_handshake(self, key: Tuple[str, str], packets: List[Packet]) -> Path:
+    def _write_handshake(self, key: Tuple[str, str], packets: List[Packet], label: str = "handshake") -> Path:
         timestamp = utcnow().strftime("%Y%m%d_%H%M%S")
-        filename = f"handshake_{key[0].replace(':', '')}_{key[1].replace(':', '')}_{timestamp}.pcap"
+        filename = f"{label}_{key[0].replace(':', '')}_{key[1].replace(':', '')}_{timestamp}.pcap"
         path = self.capture_dir / filename
         to_dump: List[Packet] = []
         beacon = self._last_beacon.get(key[0])

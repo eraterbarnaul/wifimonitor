@@ -170,8 +170,8 @@ class MainWindow(QMainWindow):
 
         handshake_group = QGroupBox("Пойманные handshakes")
         handshake_group_layout = QVBoxLayout()
-        self.hs_table = QTableWidget(0, 4)
-        self.hs_table.setHorizontalHeaderLabels(["BSSID", "Клиент", "Файл", "Создан"])
+        self.hs_table = QTableWidget(0, 5)
+        self.hs_table.setHorizontalHeaderLabels(["BSSID", "Клиент", "Тип", "Файл", "Создан"])
         self.hs_table.horizontalHeader().setStretchLastSection(True)
         self.hs_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         font = QFont("Fira Code", 10)
@@ -359,7 +359,7 @@ class MainWindow(QMainWindow):
         if row < 0:
             self._show_error("Выберите handshake")
             return
-        capture_path_item = self.hs_table.item(row, 2)
+        capture_path_item = self.hs_table.item(row, 3)
         if not capture_path_item:
             self._show_error("Не найден путь к файлу")
             return
@@ -416,10 +416,12 @@ class MainWindow(QMainWindow):
         self._targets_dirty = True
 
     def _add_handshake(self, handshake: dict) -> None:
-        key = f"{handshake.get('bssid')}->{handshake.get('station_mac')}"
+        kind = handshake.get("kind") or "handshake"
+        key = f"{handshake.get('bssid')}->{handshake.get('station_mac')}:{kind}"
         self._update_row(self.hs_table, key, [
             self._to_text(handshake.get("bssid")),
             self._to_text(handshake.get("station_mac")),
+            self._to_text(kind),
             self._to_text(handshake.get("capture_path")),
             self._to_text(handshake.get("created_at")),
         ])

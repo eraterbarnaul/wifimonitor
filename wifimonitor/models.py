@@ -28,4 +28,5 @@ class Handshake:
     bssid: str
     station_mac: str
     capture_path: str
+    kind: str = "handshake"  # "handshake" (4-way EAPOL) or "pmkid"
     created_at: datetime = field(default_factory=utcnow)

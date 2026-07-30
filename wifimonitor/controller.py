@@ -17,7 +17,9 @@ from .exporters import ExcelExporter, HashcatExporter
 from .deauth import DeauthService
 from .interface import InterfaceManager
 from .models import AccessPoint, Handshake, Station
+from .pmkid_request import request_pmkid
 from .timeutil import as_utc, utcnow
+from .wps_attack import WpsAttackService
 
 
 class WifiMonitorController(QObject):
@@ -31,6 +33,8 @@ class WifiMonitorController(QObject):
     log_generated = pyqtSignal(str)
     security_alert = pyqtSignal(str)
     probe_discovered = pyqtSignal(dict)
+    wps_state_changed = pyqtSignal(bool)
+    wps_cracked = pyqtSignal(dict)
 
     def __init__(self, db_path: Path, capture_dir: Path) -> None:
         super().__init__()
@@ -50,6 +54,7 @@ class WifiMonitorController(QObject):
         # read from the GUI thread, so all access goes through this lock.
         self._state_lock = threading.Lock()
         self.deauth_service: Optional[DeauthService] = None
+        self.wps_service: Optional[WpsAttackService] = None
         self._log("Контроллер инициализирован")
 
     def set_interface(self, interface: str) -> None:
@@ -99,6 +104,8 @@ class WifiMonitorController(QObject):
             self.monitor_service.stop()
             self.monitor_service = None
         self.stop_deauth()
+        if self.wps_service and self.wps_service.is_running():
+            self.stop_wps_attack()
         try:
             self.interface_manager.disable_monitor_mode()
         except Exception as exc:  # noqa: BLE001
@@ -234,6 +241,44 @@ class WifiMonitorController(QObject):
             self.deauth_state_changed.emit(False)
             self.status_changed.emit("Деаутентификация остановлена")
             self._log("Деаутентификация остановлена")
+
+    def start_wps_attack(self, bssid: str, channel: Optional[int]) -> None:
+        monitor_interface = self._ensure_monitor_interface()
+        if self.wps_service and self.wps_service.is_running():
+            self.wps_service.stop()
+        self.wps_service = WpsAttackService(
+            monitor_interface, log_callback=self._log, on_result=self._handle_wps_result
+        )
+        self.wps_service.start(bssid, channel)
+        self.wps_state_changed.emit(True)
+        self.status_changed.emit(f"WPS-атака на {bssid}")
+
+    def stop_wps_attack(self) -> None:
+        if self.wps_service:
+            self.wps_service.stop()
+        self.wps_state_changed.emit(False)
+        self.status_changed.emit("WPS-атака остановлена")
+
+    def _handle_wps_result(self, result: dict) -> None:
+        parts = []
+        if result.get("pin"):
+            parts.append(f"PIN {result['pin']}")
+        if result.get("psk"):
+            parts.append(f"PSK {result['psk']}")
+        self._log("WPS результат: " + ", ".join(parts))
+        self.wps_cracked.emit(result)
+
+    def request_pmkid(self, bssid: str) -> None:
+        if not self.monitor_service or not self.monitor_service.is_running():
+            raise RuntimeError("Запустите мониторинг перед запросом PMKID")
+        monitor_interface = self._ensure_monitor_interface()
+        with self._state_lock:
+            ap = self.access_points.get(bssid)
+        channel = ap.channel if ap else None
+        essid = ap.essid if ap else ""
+        if channel:
+            self.monitor_service.lock_channel(channel)
+        request_pmkid(monitor_interface, bssid, essid=essid or "", channel=channel, log=self._log)
 
     def _ensure_monitor_interface(self) -> str:
         if not self.base_interface:

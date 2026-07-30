@@ -159,6 +159,18 @@ class MainWindow(QMainWindow):
         splitter.addWidget(st_group)
 
         monitor_layout.addWidget(splitter)
+
+        attacks_row = QHBoxLayout()
+        self.wps_attack_btn = QPushButton("WPS-атака")
+        self.wps_stop_btn = QPushButton("Стоп WPS")
+        self.wps_stop_btn.setEnabled(False)
+        self.pmkid_request_btn = QPushButton("Запросить PMKID")
+        attacks_row.addWidget(QLabel("Выбранная точка:"))
+        attacks_row.addWidget(self.wps_attack_btn)
+        attacks_row.addWidget(self.wps_stop_btn)
+        attacks_row.addWidget(self.pmkid_request_btn)
+        attacks_row.addStretch()
+        monitor_layout.addLayout(attacks_row)
         monitor_tab.setLayout(monitor_layout)
         self.tabs.addTab(monitor_tab, "Мониторинг")
 
@@ -322,6 +334,11 @@ class MainWindow(QMainWindow):
         self.controller.log_generated.connect(self._append_log)
         self.controller.security_alert.connect(self._on_security_alert)
         self.controller.probe_discovered.connect(self._on_probe)
+        self.controller.wps_state_changed.connect(self._on_wps_state)
+        self.controller.wps_cracked.connect(self._on_wps_cracked)
+        self.wps_attack_btn.clicked.connect(self._on_wps_attack)
+        self.wps_stop_btn.clicked.connect(self._on_wps_stop)
+        self.pmkid_request_btn.clicked.connect(self._on_request_pmkid)
 
     def _populate_from_db(self) -> None:
         for ap in self.controller.load_access_points():
@@ -809,6 +826,82 @@ class MainWindow(QMainWindow):
         ssid = info.get("ssid")
         if mac and ssid:
             self._pnl[mac].add(ssid)
+
+    def _selected_ap_bssid(self) -> Optional[str]:
+        bssid = self._current_row_key(self.ap_table)
+        if not bssid:
+            self._show_error("Выберите точку доступа в таблице «Мониторинг»")
+        return bssid
+
+    def _on_wps_attack(self) -> None:
+        bssid = self._selected_ap_bssid()
+        if not bssid:
+            return
+        ap = self.ap_records.get(bssid, {})
+        essid = ap.get("essid") or bssid
+        if not ap.get("wps"):
+            reply = QMessageBox.question(
+                self, "WPS",
+                "У выбранной точки не обнаружен WPS. Всё равно запустить атаку?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+        reply = QMessageBox.question(
+            self, "WPS-атака",
+            f"Запустить WPS-атаку (reaver) на «{essid}»?\n"
+            "Только с разрешения владельца сети.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.wps_attack_btn.setEnabled(False)
+        self._run_async(
+            lambda: self.controller.start_wps_attack(bssid, ap.get("channel")),
+            busy="Запуск WPS-атаки…",
+            on_error=lambda: self.wps_attack_btn.setEnabled(True),
+        )
+
+    def _on_wps_stop(self) -> None:
+        self._run_async(self.controller.stop_wps_attack, busy="Остановка WPS…")
+
+    def _on_wps_state(self, running: bool) -> None:
+        self.wps_attack_btn.setEnabled(not running)
+        self.wps_stop_btn.setEnabled(running)
+
+    def _on_wps_cracked(self, result: dict) -> None:
+        parts = []
+        if result.get("pin"):
+            parts.append(f"PIN: {result['pin']}")
+        if result.get("psk"):
+            parts.append(f"PSK: {result['psk']}")
+        QMessageBox.information(self, "WPS результат", "\n".join(parts) or "Результат получен")
+
+    def _on_request_pmkid(self) -> None:
+        bssid = self._selected_ap_bssid()
+        if not bssid:
+            return
+        essid = self.ap_records.get(bssid, {}).get("essid") or bssid
+        reply = QMessageBox.question(
+            self, "Запрос PMKID",
+            f"Отправить association request к «{essid}» для получения PMKID?\n"
+            "Требуется запущенный мониторинг. Только с разрешения владельца.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.pmkid_request_btn.setEnabled(False)
+
+        def ok(_) -> None:
+            self.pmkid_request_btn.setEnabled(True)
+            self.status_bar.showMessage("PMKID-запрос отправлен (M1 будет пойман пассивно)", 6000)
+
+        self._run_async(
+            lambda: self.controller.request_pmkid(bssid),
+            busy="Запрос PMKID…",
+            on_success=ok,
+            on_error=lambda: self.pmkid_request_btn.setEnabled(True),
+        )
 
     def _record_rssi(self, key: str, signal) -> None:
         if not key or signal is None:

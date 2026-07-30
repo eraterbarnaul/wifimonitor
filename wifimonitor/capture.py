@@ -15,6 +15,42 @@ DEFAULT_CHANNELS_24GHZ = list(range(1, 14))
 DEFAULT_CHANNELS_5GHZ = [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165]
 DEFAULT_CHANNELS = DEFAULT_CHANNELS_24GHZ + DEFAULT_CHANNELS_5GHZ
 
+RSN_AKM_OUI = b"\x00\x0f\xac"
+RSN_SAE_SUITES = {RSN_AKM_OUI + b"\x08", RSN_AKM_OUI + b"\x09"}  # SAE / FT-SAE => WPA3
+WPA_VENDOR_HEADER = b"\x00\x50\xf2\x01"  # Microsoft WPA1 vendor-specific IE
+
+
+def classify_rsn(info: bytes) -> str:
+    """Classify an RSN (802.11i) element body as WPA2 and/or WPA3.
+
+    WPA3 is signalled by the SAE AKM suites (00-0F-AC-08 / 00-0F-AC-09).
+    Any parse error falls back to "WPA2", since the presence of an RSN
+    element already implies at least WPA2.
+    """
+    try:
+        # layout: version(2) group(4) pair_count(2) pair*4 akm_count(2) akm*4 ...
+        idx = 2 + 4
+        pair_count = int.from_bytes(info[idx:idx + 2], "little")
+        idx += 2 + 4 * pair_count
+        akm_count = int.from_bytes(info[idx:idx + 2], "little")
+        idx += 2
+        akms = []
+        for _ in range(akm_count):
+            suite = info[idx:idx + 4]
+            if len(suite) < 4:
+                break
+            akms.append(suite)
+            idx += 4
+        has_wpa3 = any(a in RSN_SAE_SUITES for a in akms)
+        has_wpa2 = any(a[:3] == RSN_AKM_OUI and a not in RSN_SAE_SUITES for a in akms)
+        if has_wpa3 and has_wpa2:
+            return "WPA2/WPA3"
+        if has_wpa3:
+            return "WPA3"
+        return "WPA2"
+    except Exception:  # noqa: BLE001 - malformed IE, degrade gracefully
+        return "WPA2"
+
 
 def set_interface_channel(interface: str, channel: int) -> bool:
     commands = [
@@ -144,7 +180,12 @@ class MonitorService:
             self._log("Пассивное сканирование остановлено")
 
     def _sniff_loop(self) -> None:
-        sniff(iface=self.interface, prn=self._handle_packet, store=False, stop_filter=self._should_stop)
+        try:
+            sniff(iface=self.interface, prn=self._handle_packet, store=False, stop_filter=self._should_stop)
+        except Exception as exc:  # noqa: BLE001 - surface capture errors instead of dying silently
+            self._running.clear()
+            if self._log:
+                self._log(f"Ошибка захвата на {self.interface}: {exc}")
 
     def _should_stop(self, _) -> bool:
         return not self._running.is_set()
@@ -196,16 +237,20 @@ class MonitorService:
             elif elt.ID == 3 and elt.info:
                 channel = elt.info[0]
             elif elt.ID == 48:
-                encryption.append("WPA2")
-            elif elt.ID == 221:
-                if b"RSN" in elt.info:
-                    encryption.append("WPA3")
+                encryption.append(classify_rsn(bytes(elt.info)))
+            elif elt.ID == 221 and bytes(elt.info)[:4] == WPA_VENDOR_HEADER:
+                encryption.append("WPA")
             elt = elt.payload.getlayer(Dot11Elt)
+        ordered: List[str] = []
+        for token in encryption:
+            for part in token.split("/"):
+                if part not in ordered:
+                    ordered.append(part)
         ap = AccessPoint(
             bssid=bssid,
             essid=essid,
             channel=channel,
-            encryption="/".join(encryption) if encryption else None,
+            encryption="/".join(ordered) if ordered else None,
             last_seen=datetime.utcnow(),
         )
         if signal is not None:

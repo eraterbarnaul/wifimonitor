@@ -1,4 +1,3 @@
-#!
 # Wifimonitor
 
 Wifimonitor — десктопное приложение на PyQt5 для пассивного мониторинга Wi‑Fi, захвата WPA/WPA2/WPA3 handshakes и экспорта результатов в Excel и Hashcat. Программа управляет переводом интерфейса в мониторный режим, отображает точки доступа и клиентов в реальном времени и позволяет запускать деаутентификацию выбранных клиентов для ускорения перехвата.
@@ -14,13 +13,16 @@ Wifimonitor — десктопное приложение на PyQt5 для па
 ## Установка
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-venv python3-pip aircrack-ng iw
+sudo apt install -y python3 python3-venv python3-pip aircrack-ng iw hcxtools
 
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
+
+> `hcxtools` (утилита `hcxpcapngtool`) нужен только для экспорта в формат Hashcat.
+> Мониторинг и деаутентификация работают и без него.
 
 ## Запуск
 ```bash
@@ -38,33 +40,42 @@ sudo ./.venv/bin/python -m wifimonitor.app
 - по умолчанию файлы создаются в выбранном при запуске каталоге, например `~/.wifimonitor/captures` и `wifimonitor.db`;
 - всё состояние (AP, станции, handshakes, логи) записывается в выбранную SQLite БД.
 
-## Безопасность
-Приложение рассчитано на исследование собственных сетей. Убедитесь, что имеете разрешение на перехват и деаутентификацию, и запускайте программу только с правами `root`/`sudo` на системах, где это допускается.
-   Depends: python3 (>= 3.10), aircrack-ng, iw
-   Description: GUI-инструмент для мониторинга Wi-Fi и перехвата handshake
-    Утилита с интерфейсом на PyQt5 для Kali Linux. Поддерживает мониторинг,
-    перехват WPA handshakes, деаутентификацию, экспорт в Hashcat и Excel.
-   EOF
-   ```
+## Сборка .deb пакета (опционально)
+Ниже приведён минимальный пример. Замените `wifimonitor` и `VERSION` на свои значения.
+```bash
+PKG_NAME=wifimonitor
+VERSION=1.0.0
+PKG_ROOT="/tmp/${PKG_NAME}_pkg"
 
-7. Соберите пакет:
-   ```bash
-   dpkg-deb --build "$PKG_ROOT" "${PKG_NAME}_${VERSION}_all.deb"
-   ```
+# 1. Разложите файлы приложения в дерево пакета (пример: /usr/lib/wifimonitor).
+mkdir -p "$PKG_ROOT/DEBIAN" "$PKG_ROOT/usr/lib/wifimonitor"
+cp -r wifimonitor "$PKG_ROOT/usr/lib/wifimonitor/"
 
-8. Установите и протестируйте:
-   ```bash
-   sudo dpkg -i "${PKG_NAME}_${VERSION}_all.deb"
-   sudo wifimonitor
-   ```
+# 2. Опишите метаданные пакета.
+cat > "$PKG_ROOT/DEBIAN/control" <<EOF
+Package: ${PKG_NAME}
+Version: ${VERSION}
+Architecture: all
+Maintainer: you@example.com
+Depends: python3 (>= 3.10), python3-pyqt5, python3-scapy, python3-openpyxl, aircrack-ng, iw
+Description: GUI-инструмент для мониторинга Wi-Fi и перехвата handshake
+ Утилита с интерфейсом на PyQt5 для Kali Linux. Поддерживает мониторинг,
+ перехват WPA handshakes, деаутентификацию, экспорт в Hashcat и Excel.
+EOF
 
-При необходимости добавьте в `DEBIAN/postinst` запуск `ldconfig`, проверку зависимостей или создание ярлыка `.desktop`.
+# 3. Соберите пакет.
+dpkg-deb --build "$PKG_ROOT" "${PKG_NAME}_${VERSION}_all.deb"
+
+# 4. Установите и протестируйте.
+sudo dpkg -i "${PKG_NAME}_${VERSION}_all.deb"
+```
+При необходимости добавьте в `DEBIAN/postinst` проверку зависимостей или создание ярлыка `.desktop`.
 
 ## Диагностика
 - Если интерфейс не появляется в списке, проверьте наличие беспроводных адаптеров: `iw dev`.
 - Для корректной работы деаутентификации требуется поддержка режима мониторинга и пакетной отправки на адаптере.
 - При ошибках `hcxpcapngtool` убедитесь, что утилита установлена: `sudo apt install hcxtools`.
-- Логи приложения и дампы хранятся в `~/.wifimonitor`.
+- Логи сессии видны в интерфейсе на вкладке «Перехват»; pcap-дампы сохраняются в выбранном каталоге захватов.
 
-## Правовой статус
-Автор программы и сопровождающие не несут ответственности за незаконное использование. Перед эксплуатацией убедитесь, что у вас есть разрешение на тестирование соответствующей сети.
+## Безопасность и правовой статус
+Приложение рассчитано на исследование собственных сетей и авторизованное тестирование. Убедитесь, что имеете письменное разрешение на перехват и деаутентификацию, и запускайте программу только с правами `root`/`sudo` на системах, где это допускается. Автор программы и сопровождающие не несут ответственности за незаконное использование.

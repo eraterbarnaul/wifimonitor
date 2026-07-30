@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 from collections import defaultdict
 from dataclasses import asdict
@@ -225,5 +226,6 @@ class WifiMonitorController(QObject):
         return [dict(row) for row in self.db.fetch_handshakes()]
 
     def _log(self, message: str) -> None:
+        logging.getLogger("wifimonitor").info(message)
         timestamp = utcnow().strftime("%H:%M:%S")
         self.log_generated.emit(f"[{timestamp}] {message}")

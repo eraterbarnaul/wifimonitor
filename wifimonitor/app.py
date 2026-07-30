@@ -1,3 +1,4 @@
+import logging
 import sys
 from pathlib import Path
 from typing import Optional, Tuple
@@ -8,9 +9,11 @@ if __package__ in (None, ""):
     package_root = Path(__file__).resolve().parent.parent
     sys.path.insert(0, str(package_root))
     from wifimonitor.controller import WifiMonitorController
+    from wifimonitor.logging_setup import configure_logging
     from wifimonitor.ui.main_window import MainWindow
 else:
     from .controller import WifiMonitorController
+    from .logging_setup import configure_logging
     from .ui.main_window import MainWindow
 
 
@@ -43,6 +46,7 @@ def _select_storage(default_dir: Path) -> Optional[Tuple[Path, Path]]:
 
 def main() -> None:
     app = QApplication(sys.argv)
+    configure_logging(Path.home() / ".wifimonitor")
     theme_path = Path(__file__).resolve().parent / "ui" / "styles" / "cyberpunk.qss"
     if theme_path.exists():
         with theme_path.open("r", encoding="utf-8") as fh:
@@ -52,6 +56,7 @@ def main() -> None:
         QMessageBox.information(None, "Wifimonitor", "Запуск отменён: база данных не выбрана.")
         sys.exit(0)
     db_path, capture_dir = storage
+    logging.getLogger("wifimonitor").info("Хранилище: БД=%s, захваты=%s", db_path, capture_dir)
     controller = WifiMonitorController(db_path=db_path, capture_dir=capture_dir)
     window = MainWindow(controller, db_path=db_path, capture_dir=capture_dir)
     window.show()

@@ -1,5 +1,5 @@
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
@@ -30,7 +30,11 @@ from PyQt5.QtWidgets import (
 )
 
 from ..controller import WifiMonitorController
+from ..timeutil import as_utc, utcnow
 from .workers import Worker
+
+# Aware "oldest possible" sentinel so rows without a timestamp sort last.
+_MIN_DT = datetime.min.replace(tzinfo=timezone.utc)
 
 
 class MainWindow(QMainWindow):
@@ -483,7 +487,7 @@ class MainWindow(QMainWindow):
         self.ap_table.setUpdatesEnabled(False)
         rows = sorted(
             self.ap_records.items(),
-            key=lambda item: item[1].get("last_seen_dt") or datetime.min,
+            key=lambda item: item[1].get("last_seen_dt") or _MIN_DT,
             reverse=True,
         )
         self.ap_table.setRowCount(len(rows))
@@ -498,7 +502,7 @@ class MainWindow(QMainWindow):
         self.st_table.setUpdatesEnabled(False)
         rows = sorted(
             self.station_records.items(),
-            key=lambda item: item[1].get("last_seen_dt") or datetime.min,
+            key=lambda item: item[1].get("last_seen_dt") or _MIN_DT,
             reverse=True,
         )
         self.st_table.setRowCount(len(rows))
@@ -597,7 +601,7 @@ class MainWindow(QMainWindow):
         if not last_seen:
             return False
         limit = threshold if threshold is not None else self.TARGET_STALE_SECONDS
-        return (datetime.utcnow() - last_seen) <= timedelta(seconds=limit)
+        return (utcnow() - last_seen) <= timedelta(seconds=limit)
 
     def _active_clients_for_ap(self, bssid: str) -> List[str]:
         clients = self.clients_map.get(bssid, set())
@@ -613,7 +617,7 @@ class MainWindow(QMainWindow):
     def _format_time_since(self, last_seen: Optional[datetime]) -> str:
         if not last_seen:
             return ""
-        now = datetime.utcnow()
+        now = utcnow()
         delta = now - last_seen
         seconds = int(max(delta.total_seconds(), 0))
         if seconds < 1:
@@ -631,10 +635,10 @@ class MainWindow(QMainWindow):
 
     def _parse_timestamp(self, value) -> Optional[datetime]:
         if isinstance(value, datetime):
-            return value
+            return as_utc(value)
         if isinstance(value, str) and value:
             try:
-                return datetime.fromisoformat(value)
+                return as_utc(datetime.fromisoformat(value))
             except ValueError:
                 return None
         return None

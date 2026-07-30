@@ -2,7 +2,6 @@ import subprocess
 import threading
 import time
 from collections import defaultdict
-from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
@@ -10,7 +9,8 @@ from scapy.all import Dot11, Dot11Beacon, Dot11Elt, Dot11ProbeResp, EAPOL, sniff
 from scapy.packet import Packet  # type: ignore
 
 from .models import AccessPoint, Handshake, Station
-from .wifi_ie import WPA_VENDOR_HEADER, classify_rsn
+from .timeutil import utcnow
+from .wifi_ie import WPA_VENDOR_HEADER, classify_rsn, frequency_to_channel
 
 DEFAULT_CHANNELS_24GHZ = list(range(1, 14))
 DEFAULT_CHANNELS_5GHZ = [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165]
@@ -175,7 +175,7 @@ class MonitorService:
                         self._last_beacon[bssid] = packet
         elif dot11.type == 2:
             station_mac = dot11.addr2
-            station = Station(mac=station_mac, associated_bssid=bssid, last_seen=datetime.utcnow())
+            station = Station(mac=station_mac, associated_bssid=bssid, last_seen=utcnow())
             signal = getattr(packet, "dBm_AntSignal", None)
             if signal is not None:
                 station.signal = int(signal)
@@ -193,6 +193,7 @@ class MonitorService:
             return None
         essid = None
         channel = None
+        ht_channel = None
         encryption = []
         signal = getattr(packet, "dBm_AntSignal", None)
         elt = packet.getlayer(Dot11Elt)
@@ -201,11 +202,19 @@ class MonitorService:
                 essid = elt.info.decode(errors="ignore") or None
             elif elt.ID == 3 and elt.info:
                 channel = elt.info[0]
+            elif elt.ID == 61 and elt.info:
+                ht_channel = elt.info[0]  # HT Operation: primary channel (5 GHz)
             elif elt.ID == 48:
                 encryption.append(classify_rsn(bytes(elt.info)))
             elif elt.ID == 221 and bytes(elt.info)[:4] == WPA_VENDOR_HEADER:
                 encryption.append("WPA")
             elt = elt.payload.getlayer(Dot11Elt)
+        # DS Parameter Set (IE 3) is usually absent on 5/6 GHz; fall back to the
+        # HT Operation primary channel and finally the RadioTap frequency.
+        if not channel:
+            channel = ht_channel
+        if not channel:
+            channel = frequency_to_channel(getattr(packet, "ChannelFrequency", None))
         ordered: List[str] = []
         for token in encryption:
             for part in token.split("/"):
@@ -216,7 +225,7 @@ class MonitorService:
             essid=essid,
             channel=channel,
             encryption="/".join(ordered) if ordered else None,
-            last_seen=datetime.utcnow(),
+            last_seen=utcnow(),
         )
         if signal is not None:
             ap.signal = int(signal)
@@ -337,7 +346,7 @@ class MonitorService:
         return key_info, ack, install, mic, secure, msg
 
     def _write_handshake(self, key: Tuple[str, str], packets: List[Packet]) -> Path:
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        timestamp = utcnow().strftime("%Y%m%d_%H%M%S")
         filename = f"handshake_{key[0].replace(':', '')}_{key[1].replace(':', '')}_{timestamp}.pcap"
         path = self.capture_dir / filename
         to_dump: List[Packet] = []

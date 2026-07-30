@@ -4,7 +4,7 @@ These import only :mod:`wifimonitor.wifi_ie`, so they run without scapy, PyQt5
 or a wireless adapter present.
 """
 
-from wifimonitor.wifi_ie import classify_rsn
+from wifimonitor.wifi_ie import classify_rsn, frequency_to_channel
 
 WPA2_PSK = b"\x00\x0f\xac\x02"
 WPA2_ENT = b"\x00\x0f\xac\x01"
@@ -47,3 +47,27 @@ def test_malformed_bodies_degrade_to_wpa2():
     assert classify_rsn(b"") == "WPA2"
     assert classify_rsn(b"\x01\x00") == "WPA2"
     assert classify_rsn(b"\x01\x00\x00\x0f\xac\x04\xff\xff") == "WPA2"
+
+
+def test_frequency_to_channel_24ghz():
+    assert frequency_to_channel(2412) == 1
+    assert frequency_to_channel(2437) == 6
+    assert frequency_to_channel(2472) == 13
+    assert frequency_to_channel(2484) == 14
+
+
+def test_frequency_to_channel_5ghz():
+    assert frequency_to_channel(5180) == 36
+    assert frequency_to_channel(5745) == 149
+    assert frequency_to_channel(5825) == 165
+
+
+def test_frequency_to_channel_6ghz():
+    assert frequency_to_channel(5955) == 1
+    assert frequency_to_channel(6175) == 45
+
+
+def test_frequency_to_channel_unknown_or_missing():
+    assert frequency_to_channel(None) is None
+    assert frequency_to_channel(0) is None
+    assert frequency_to_channel(3000) is None

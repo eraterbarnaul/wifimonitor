@@ -15,6 +15,7 @@ from .exporters import ExcelExporter, HashcatExporter
 from .deauth import DeauthService
 from .interface import InterfaceManager
 from .models import AccessPoint, Handshake, Station
+from .timeutil import as_utc, utcnow
 
 
 class WifiMonitorController(QObject):
@@ -202,7 +203,7 @@ class WifiMonitorController(QObject):
                 channel=row.get("channel"),
                 encryption=row.get("encryption"),
                 signal=row.get("signal"),
-                last_seen=datetime.fromisoformat(last_seen) if last_seen else datetime.utcnow(),
+                last_seen=as_utc(datetime.fromisoformat(last_seen)) if last_seen else utcnow(),
             )
             with self._state_lock:
                 self.access_points[ap.bssid] = ap
@@ -222,5 +223,5 @@ class WifiMonitorController(QObject):
         return [dict(row) for row in self.db.fetch_handshakes()]
 
     def _log(self, message: str) -> None:
-        timestamp = datetime.utcnow().strftime("%H:%M:%S")
+        timestamp = utcnow().strftime("%H:%M:%S")
         self.log_generated.emit(f"[{timestamp}] {message}")

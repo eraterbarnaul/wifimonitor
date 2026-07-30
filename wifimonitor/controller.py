@@ -140,6 +140,15 @@ class WifiMonitorController(QObject):
         stations = [dict(row) for row in self.db.fetch_stations()]
         return self.csv_exporter.export(output_path, access_points, stations)
 
+    def export_report(self, output_path: Path) -> None:
+        from .report import build_html_report
+
+        access_points = [dict(row) for row in self.db.fetch_access_points()]
+        stations = [dict(row) for row in self.db.fetch_stations()]
+        handshakes = [dict(row) for row in self.db.fetch_handshakes()]
+        html = build_html_report(access_points, stations, handshakes)
+        Path(output_path).write_text(html, encoding="utf-8")
+
 
     def refresh_interfaces(self) -> List[str]:
         interfaces = self.interface_manager.list_wireless_interfaces()

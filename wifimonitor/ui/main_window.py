@@ -3,9 +3,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QThreadPool, QTimer
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
+    QAbstractItemView,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -29,6 +30,7 @@ from PyQt5.QtWidgets import (
 )
 
 from ..controller import WifiMonitorController
+from .workers import Worker
 
 
 class MainWindow(QMainWindow):
@@ -39,21 +41,27 @@ class MainWindow(QMainWindow):
         self.controller = controller
         self.setWindowTitle("Wifimonitor")
         self.resize(1200, 800)
+        self.setMinimumSize(960, 640)
         self.ap_records: Dict[str, dict] = {}
         self.station_records: Dict[str, dict] = {}
         self.clients_map: Dict[str, Set[str]] = defaultdict(set)
         self.db_path = db_path
         self.capture_dir = capture_dir
+        # Coalesced GUI refresh: capture callbacks only mark state dirty; the
+        # periodic tick redraws the tables so a busy sniffer can't flood the UI.
+        self._targets_dirty = False
+        self._capture_running = False
+        self._pool = QThreadPool.globalInstance()
+        self._active_workers: Set[Worker] = set()
         self._setup_ui()
         self._connect_signals()
         self._populate_from_db()
         self._on_deauth_state(False)
-        self._refresh_targets()
         self.controller.refresh_interfaces()
         self._announce_storage()
         self._relative_timer = QTimer(self)
         self._relative_timer.setInterval(1000)
-        self._relative_timer.timeout.connect(self._refresh_relative_rows)
+        self._relative_timer.timeout.connect(self._on_tick)
         self._relative_timer.start()
 
     def _setup_ui(self) -> None:
@@ -74,6 +82,7 @@ class MainWindow(QMainWindow):
         self.disable_monitor_btn = QPushButton("Выключить монитор")
         self.start_capture_btn = QPushButton("Старт")
         self.stop_capture_btn = QPushButton("Стоп")
+        self.stop_capture_btn.setEnabled(False)
 
         for btn in [
             self.refresh_interfaces_btn,
@@ -171,6 +180,12 @@ class MainWindow(QMainWindow):
         self.hs_table.setFont(font)
         self.hs_table.horizontalHeader().setFont(font)
         self.hs_table.verticalHeader().setFont(font)
+        for table in (self.ap_table, self.st_table, self.hs_table):
+            table.setSelectionBehavior(QAbstractItemView.SelectRows)
+            table.setSelectionMode(QAbstractItemView.SingleSelection)
+            table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            table.setAlternatingRowColors(True)
+            table.verticalHeader().setVisible(False)
         handshake_group_layout.addWidget(self.hs_table)
         handshake_group.setLayout(handshake_group_layout)
         handshake_layout.addWidget(handshake_group)
@@ -231,7 +246,10 @@ class MainWindow(QMainWindow):
             self._add_station(station)
         for handshake in self.controller.load_handshakes():
             self._add_handshake(handshake)
+        self._rebuild_access_point_table()
+        self._rebuild_station_table()
         self._refresh_targets()
+        self._targets_dirty = False
 
     def _on_set_interface(self) -> None:
         interface = self.interface_combo.currentText().strip()
@@ -241,39 +259,96 @@ class MainWindow(QMainWindow):
         self.controller.set_interface(interface)
         self.status_bar.showMessage(f"Выбран интерфейс {interface}")
 
+    def _run_async(self, fn, *, busy=None, on_success=None, on_error=None) -> None:
+        """Run ``fn`` in a pool thread so the GUI stays responsive.
+
+        ``on_success(result)`` and ``on_error()`` run back on the GUI thread.
+        The worker is kept referenced until it finishes so its queued signals
+        are not dropped.
+        """
+        if busy:
+            self.status_bar.showMessage(busy)
+        worker = Worker(fn)
+        worker.setAutoDelete(False)
+        self._active_workers.add(worker)
+
+        def _done(result) -> None:
+            self._active_workers.discard(worker)
+            if on_success is not None:
+                on_success(result)
+
+        def _fail(message: str) -> None:
+            self._active_workers.discard(worker)
+            if on_error is not None:
+                on_error()
+            self._show_error(message)
+
+        worker.signals.finished.connect(_done)
+        worker.signals.failed.connect(_fail)
+        self._pool.start(worker)
+
     def _on_enable_monitor(self) -> None:
-        try:
-            self.controller.enable_monitor_mode()
-        except Exception as exc:
-            self._show_error(str(exc))
+        self.enable_monitor_btn.setEnabled(False)
+        self._run_async(
+            self.controller.enable_monitor_mode,
+            busy="Включение мониторного режима…",
+            on_success=lambda _: self.enable_monitor_btn.setEnabled(True),
+            on_error=lambda: self.enable_monitor_btn.setEnabled(True),
+        )
 
     def _on_disable_monitor(self) -> None:
-        try:
-            self.controller.disable_monitor_mode()
-        except Exception as exc:
-            self._show_error(str(exc))
+        self.disable_monitor_btn.setEnabled(False)
+        self._run_async(
+            self.controller.disable_monitor_mode,
+            busy="Выключение мониторного режима…",
+            on_success=lambda _: self.disable_monitor_btn.setEnabled(True),
+            on_error=lambda: self.disable_monitor_btn.setEnabled(True),
+        )
 
     def _on_start_capture(self) -> None:
-        try:
-            self.controller.start_capture()
-        except Exception as exc:
-            self._show_error(str(exc))
+        self.start_capture_btn.setEnabled(False)
+
+        def ok(_) -> None:
+            self._capture_running = True
+            self.stop_capture_btn.setEnabled(True)
+
+        self._run_async(
+            self.controller.start_capture,
+            busy="Запуск захвата…",
+            on_success=ok,
+            on_error=lambda: self.start_capture_btn.setEnabled(True),
+        )
 
     def _on_stop_capture(self) -> None:
-        try:
-            self.controller.stop_capture()
-        except Exception as exc:
-            self._show_error(str(exc))
+        self.stop_capture_btn.setEnabled(False)
+
+        def ok(_) -> None:
+            self._capture_running = False
+            self.start_capture_btn.setEnabled(True)
+
+        self._run_async(
+            self.controller.stop_capture,
+            busy="Остановка захвата…",
+            on_success=ok,
+            on_error=lambda: self.stop_capture_btn.setEnabled(True),
+        )
 
     def _on_export_excel(self) -> None:
         destination, _ = QFileDialog.getSaveFileName(self, "Сохранить Excel", "results.xlsx", "Excel (*.xlsx)")
         if not destination:
             return
-        try:
-            self.controller.export_excel(Path(destination))
+        self.export_excel_btn.setEnabled(False)
+
+        def ok(_) -> None:
+            self.export_excel_btn.setEnabled(True)
             self.status_bar.showMessage("Экспорт Excel выполнен", 5000)
-        except Exception as exc:
-            self._show_error(str(exc))
+
+        self._run_async(
+            lambda: self.controller.export_excel(Path(destination)),
+            busy="Экспорт в Excel…",
+            on_success=ok,
+            on_error=lambda: self.export_excel_btn.setEnabled(True),
+        )
 
     def _on_export_hashcat(self) -> None:
         row = self.hs_table.currentRow()
@@ -288,11 +363,18 @@ class MainWindow(QMainWindow):
         destination, _ = QFileDialog.getSaveFileName(self, "Сохранить Hashcat", f"{capture_path.stem}.hc22000", "Hashcat (*.hc22000)")
         if not destination:
             return
-        try:
-            self.controller.export_hashcat(capture_path, Path(destination))
+        self.export_hashcat_btn.setEnabled(False)
+
+        def ok(_) -> None:
+            self.export_hashcat_btn.setEnabled(True)
             self.status_bar.showMessage("Экспорт Hashcat выполнен", 5000)
-        except Exception as exc:
-            self._show_error(str(exc))
+
+        self._run_async(
+            lambda: self.controller.export_hashcat(capture_path, Path(destination)),
+            busy="Экспорт в Hashcat…",
+            on_success=ok,
+            on_error=lambda: self.export_hashcat_btn.setEnabled(True),
+        )
 
     def _add_access_point(self, ap: dict) -> None:
         ap = dict(ap)
@@ -307,8 +389,7 @@ class MainWindow(QMainWindow):
         if last_seen_dt:
             ap["last_seen_dt"] = last_seen_dt
         self.ap_records[bssid] = {**previous, **ap}
-        self._rebuild_access_point_table()
-        self._refresh_targets()
+        self._targets_dirty = True
 
     def _add_station(self, station: dict) -> None:
         station = dict(station)
@@ -328,10 +409,7 @@ class MainWindow(QMainWindow):
         self.station_records[mac] = {**previous, **station}
         if bssid:
             self.clients_map[bssid].add(mac)
-        self._rebuild_station_table()
-        if bssid:
-            self._rebuild_access_point_table()
-            self._refresh_targets()
+        self._targets_dirty = True
 
     def _add_handshake(self, handshake: dict) -> None:
         key = f"{handshake.get('bssid')}->{handshake.get('station_mac')}"
@@ -386,7 +464,23 @@ class MainWindow(QMainWindow):
             return ""
         return str(value)
 
+    def _current_row_key(self, table: QTableWidget) -> Optional[str]:
+        row = table.currentRow()
+        if row < 0:
+            return None
+        header = table.verticalHeaderItem(row)
+        return header.data(Qt.UserRole) if header else None
+
+    def _restore_row_key(self, table: QTableWidget, key: Optional[str]) -> None:
+        if not key:
+            return
+        row = self._find_row(table, key)
+        if row is not None:
+            table.setCurrentCell(row, 0)
+
     def _rebuild_access_point_table(self) -> None:
+        key = self._current_row_key(self.ap_table)
+        self.ap_table.setUpdatesEnabled(False)
         rows = sorted(
             self.ap_records.items(),
             key=lambda item: item[1].get("last_seen_dt") or datetime.min,
@@ -396,8 +490,12 @@ class MainWindow(QMainWindow):
         for row_idx, (bssid, ap) in enumerate(rows):
             self._set_access_point_row(row_idx, bssid, ap)
         self._auto_resize_table(self.ap_table)
+        self.ap_table.setUpdatesEnabled(True)
+        self._restore_row_key(self.ap_table, key)
 
     def _rebuild_station_table(self) -> None:
+        key = self._current_row_key(self.st_table)
+        self.st_table.setUpdatesEnabled(False)
         rows = sorted(
             self.station_records.items(),
             key=lambda item: item[1].get("last_seen_dt") or datetime.min,
@@ -407,6 +505,8 @@ class MainWindow(QMainWindow):
         for row_idx, (mac, station) in enumerate(rows):
             self._set_station_row(row_idx, mac, station)
         self._auto_resize_table(self.st_table)
+        self.st_table.setUpdatesEnabled(True)
+        self._restore_row_key(self.st_table, key)
 
     def _set_access_point_row(self, row_idx: int, bssid: str, ap: dict) -> None:
         key_item = QTableWidgetItem(bssid)
@@ -478,9 +578,15 @@ class MainWindow(QMainWindow):
         last_seen_item.setData(Qt.UserRole, last_seen_dt.timestamp() if last_seen_dt else float("-inf"))
         self.st_table.setItem(row_idx, 3, last_seen_item)
 
-    def _refresh_relative_rows(self) -> None:
+    def _on_tick(self) -> None:
+        # Runs once per second: redraw tables so relative "last seen" values
+        # keep counting, and refresh the deauth target combos only when new
+        # access points or clients arrived since the previous tick.
         self._rebuild_access_point_table()
         self._rebuild_station_table()
+        if self._targets_dirty:
+            self._refresh_targets()
+            self._targets_dirty = False
 
     def _auto_resize_table(self, table: QTableWidget) -> None:
         if table.columnCount() == 0:
@@ -622,12 +728,19 @@ class MainWindow(QMainWindow):
         self.interface_combo.blockSignals(False)
 
     def _on_refresh_interfaces(self) -> None:
-        try:
-            interfaces = self.controller.refresh_interfaces()
+        self.refresh_interfaces_btn.setEnabled(False)
+
+        def ok(interfaces) -> None:
+            self.refresh_interfaces_btn.setEnabled(True)
             if not interfaces:
                 self.status_bar.showMessage("Беспроводные интерфейсы не найдены", 5000)
-        except Exception as exc:
-            self._show_error(str(exc))
+
+        self._run_async(
+            self.controller.refresh_interfaces,
+            busy="Обновление списка интерфейсов…",
+            on_success=ok,
+            on_error=lambda: self.refresh_interfaces_btn.setEnabled(True),
+        )
 
     def _on_start_deauth(self) -> None:
         bssid = self.target_ap_combo.currentData()
@@ -642,6 +755,18 @@ class MainWindow(QMainWindow):
             clients = sorted(self._active_clients_for_ap(bssid))
         if not clients:
             self._show_error("Активные клиенты не найдены")
+            return
+        essid = self.ap_records.get(bssid, {}).get("essid") or bssid
+        target = clients[0] if len(clients) == 1 else f"всех активных клиентов ({len(clients)})"
+        reply = QMessageBox.question(
+            self,
+            "Подтверждение деаутентификации",
+            f"Отправить deauth-кадры для {target} на сети «{essid}»?\n\n"
+            "Убедитесь, что у вас есть разрешение на тестирование этой сети.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
             return
         try:
             self.controller.start_deauth(

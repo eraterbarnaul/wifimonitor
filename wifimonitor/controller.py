@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from collections import defaultdict
 from dataclasses import asdict
 from datetime import datetime
@@ -38,6 +39,9 @@ class WifiMonitorController(QObject):
         self.base_interface: Optional[str] = None
         self.access_points: Dict[str, AccessPoint] = {}
         self.clients_by_ap: Dict[str, Set[str]] = defaultdict(set)
+        # access_points / clients_by_ap are written from the sniff thread and
+        # read from the GUI thread, so all access goes through this lock.
+        self._state_lock = threading.Lock()
         self.deauth_service: Optional[DeauthService] = None
         self._log("Контроллер инициализирован")
 
@@ -98,13 +102,15 @@ class WifiMonitorController(QObject):
 
     def _handle_access_point(self, ap: AccessPoint) -> None:
         self.db.upsert_access_point(ap)
-        self.access_points[ap.bssid] = ap
+        with self._state_lock:
+            self.access_points[ap.bssid] = ap
         self.access_point_discovered.emit(asdict(ap))
 
     def _handle_station(self, station: Station) -> None:
         self.db.upsert_station(station)
         if station.associated_bssid:
-            self.clients_by_ap[station.associated_bssid].add(station.mac)
+            with self._state_lock:
+                self.clients_by_ap[station.associated_bssid].add(station.mac)
         self.station_discovered.emit(asdict(station))
 
     def _handle_handshake(self, handshake: Handshake) -> None:
@@ -136,7 +142,8 @@ class WifiMonitorController(QObject):
         return interfaces
 
     def get_clients_for_ap(self, bssid: str) -> List[str]:
-        return sorted(self.clients_by_ap.get(bssid, set()))
+        with self._state_lock:
+            return sorted(self.clients_by_ap.get(bssid, set()))
 
     def start_deauth(self, bssid: str, clients: List[str], packets: int, interval: float) -> None:
         if not clients:
@@ -148,7 +155,8 @@ class WifiMonitorController(QObject):
             if self.deauth_service:
                 self.deauth_service.stop()
             self.deauth_service = DeauthService(monitor_interface, log_callback=self._log)
-        ap = self.access_points.get(bssid)
+        with self._state_lock:
+            ap = self.access_points.get(bssid)
         locked_channel = None
         if ap and ap.channel:
             if self.monitor_service.lock_channel(ap.channel):
@@ -196,7 +204,8 @@ class WifiMonitorController(QObject):
                 signal=row.get("signal"),
                 last_seen=datetime.fromisoformat(last_seen) if last_seen else datetime.utcnow(),
             )
-            self.access_points[ap.bssid] = ap
+            with self._state_lock:
+                self.access_points[ap.bssid] = ap
         return rows
 
     def load_stations(self) -> List[dict]:
@@ -205,7 +214,8 @@ class WifiMonitorController(QObject):
             bssid = row.get("associated_bssid")
             mac = row.get("mac")
             if bssid and mac:
-                self.clients_by_ap[bssid].add(mac)
+                with self._state_lock:
+                    self.clients_by_ap[bssid].add(mac)
         return rows
 
     def load_handshakes(self) -> List[dict]:

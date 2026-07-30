@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Set
 from PyQt5.QtCore import QObject, pyqtSignal
 
 from .capture import MonitorService
+from .csv_export import CsvExporter
 from .database import DatabaseManager
 from .exporters import ExcelExporter, HashcatExporter
 from .deauth import DeauthService
@@ -37,6 +38,7 @@ class WifiMonitorController(QObject):
         self.monitor_service: Optional[MonitorService] = None
         self.hashcat_exporter = HashcatExporter()
         self.excel_exporter = ExcelExporter()
+        self.csv_exporter = CsvExporter()
         self.current_interface: Optional[str] = None
         self.base_interface: Optional[str] = None
         self.access_points: Dict[str, AccessPoint] = {}
@@ -132,6 +134,11 @@ class WifiMonitorController(QObject):
         stations = [dict(row) for row in self.db.fetch_stations()]
         handshakes = [dict(row) for row in self.db.fetch_handshakes()]
         self.excel_exporter.export(output_path, access_points, stations, handshakes)
+
+    def export_csv(self, output_path: Path) -> Path:
+        access_points = [dict(row) for row in self.db.fetch_access_points()]
+        stations = [dict(row) for row in self.db.fetch_stations()]
+        return self.csv_exporter.export(output_path, access_points, stations)
 
 
     def refresh_interfaces(self) -> List[str]:

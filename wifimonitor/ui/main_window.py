@@ -14,6 +14,7 @@ from PyQt5.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -55,6 +56,9 @@ class MainWindow(QMainWindow):
         # periodic tick redraws the tables so a busy sniffer can't flood the UI.
         self._targets_dirty = False
         self._capture_running = False
+        self._filter_text = ""
+        self._ap_sort_col = 7  # "Обновлено" by default
+        self._ap_sort_desc = True
         self._pool = QThreadPool.globalInstance()
         self._active_workers: Set[Worker] = set()
         self._settings = QSettings("wifimonitor", "wifimonitor")
@@ -105,12 +109,23 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         monitor_tab = QWidget()
         monitor_layout = QVBoxLayout()
+
+        search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("Поиск:"))
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Фильтр по BSSID, ESSID или MAC")
+        self.search_edit.setClearButtonEnabled(True)
+        search_row.addWidget(self.search_edit)
+        monitor_layout.addLayout(search_row)
+
         splitter = QSplitter(Qt.Vertical)
 
         self.ap_table = QTableWidget(0, 8)
         self.ap_table.setHorizontalHeaderLabels(["№", "BSSID", "ESSID", "Канал", "Шифрование", "Сигнал", "Клиенты", "Обновлено"])
         self.ap_table.horizontalHeader().setStretchLastSection(True)
         self.ap_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.ap_table.horizontalHeader().setSectionsClickable(True)
+        self.ap_table.horizontalHeader().sectionClicked.connect(self._on_ap_header_clicked)
         ap_group = QGroupBox("Точки доступа")
         ap_layout = QVBoxLayout()
         ap_layout.addWidget(self.ap_table)
@@ -213,8 +228,10 @@ class MainWindow(QMainWindow):
 
         export_layout = QHBoxLayout()
         self.export_excel_btn = QPushButton("Экспорт Excel")
+        self.export_csv_btn = QPushButton("Экспорт CSV")
         self.export_hashcat_btn = QPushButton("Экспорт Hashcat")
         export_layout.addWidget(self.export_excel_btn)
+        export_layout.addWidget(self.export_csv_btn)
         export_layout.addWidget(self.export_hashcat_btn)
         export_layout.addStretch()
         layout.addLayout(export_layout)
@@ -231,7 +248,9 @@ class MainWindow(QMainWindow):
         self.start_capture_btn.clicked.connect(self._on_start_capture)
         self.stop_capture_btn.clicked.connect(self._on_stop_capture)
         self.export_excel_btn.clicked.connect(self._on_export_excel)
+        self.export_csv_btn.clicked.connect(self._on_export_csv)
         self.export_hashcat_btn.clicked.connect(self._on_export_hashcat)
+        self.search_edit.textChanged.connect(self._on_search_changed)
         self.refresh_interfaces_btn.clicked.connect(self._on_refresh_interfaces)
         self.start_deauth_btn.clicked.connect(self._on_start_deauth)
         self.stop_deauth_btn.clicked.connect(self._on_stop_deauth)
@@ -355,6 +374,23 @@ class MainWindow(QMainWindow):
             busy="Экспорт в Excel…",
             on_success=ok,
             on_error=lambda: self.export_excel_btn.setEnabled(True),
+        )
+
+    def _on_export_csv(self) -> None:
+        destination, _ = QFileDialog.getSaveFileName(self, "Сохранить CSV", "networks.csv", "CSV (*.csv)")
+        if not destination:
+            return
+        self.export_csv_btn.setEnabled(False)
+
+        def ok(clients_path) -> None:
+            self.export_csv_btn.setEnabled(True)
+            self.status_bar.showMessage(f"CSV сохранён (клиенты: {Path(clients_path).name})", 5000)
+
+        self._run_async(
+            lambda: self.controller.export_csv(Path(destination)),
+            busy="Экспорт в CSV…",
+            on_success=ok,
+            on_error=lambda: self.export_csv_btn.setEnabled(True),
         )
 
     def _on_export_hashcat(self) -> None:
@@ -487,18 +523,43 @@ class MainWindow(QMainWindow):
         if row is not None:
             table.setCurrentCell(row, 0)
 
+    def _ap_sort_key(self, item):
+        bssid, ap = item
+        col = self._ap_sort_col
+        if col == 1:
+            return (ap.get("bssid") or "").lower()
+        if col == 2:
+            return (ap.get("essid") or "").lower()
+        if col == 3:
+            return ap.get("channel") or 0
+        if col == 4:
+            return (ap.get("encryption") or "").lower()
+        if col == 5:
+            signal = ap.get("signal")
+            return signal if signal is not None else -9999
+        if col == 6:
+            return len(self._active_clients_for_ap(bssid))
+        return ap.get("last_seen_dt") or _MIN_DT
+
+    def _on_ap_header_clicked(self, col: int) -> None:
+        if col == 0:  # the row-number column is not a sort key
+            return
+        if col == self._ap_sort_col:
+            self._ap_sort_desc = not self._ap_sort_desc
+        else:
+            self._ap_sort_col = col
+            self._ap_sort_desc = col in (5, 6, 7)  # signal / clients / last-seen default to desc
+        self._rebuild_access_point_table()
+
     def _rebuild_access_point_table(self) -> None:
         key = self._current_row_key(self.ap_table)
         self.ap_table.setUpdatesEnabled(False)
-        rows = sorted(
-            self.ap_records.items(),
-            key=lambda item: item[1].get("last_seen_dt") or _MIN_DT,
-            reverse=True,
-        )
+        rows = sorted(self.ap_records.items(), key=self._ap_sort_key, reverse=self._ap_sort_desc)
         self.ap_table.setRowCount(len(rows))
         for row_idx, (bssid, ap) in enumerate(rows):
             self._set_access_point_row(row_idx, bssid, ap)
         self._auto_resize_table(self.ap_table)
+        self._apply_filter(self.ap_table)
         self.ap_table.setUpdatesEnabled(True)
         self._restore_row_key(self.ap_table, key)
 
@@ -514,8 +575,28 @@ class MainWindow(QMainWindow):
         for row_idx, (mac, station) in enumerate(rows):
             self._set_station_row(row_idx, mac, station)
         self._auto_resize_table(self.st_table)
+        self._apply_filter(self.st_table)
         self.st_table.setUpdatesEnabled(True)
         self._restore_row_key(self.st_table, key)
+
+    def _on_search_changed(self, text: str) -> None:
+        self._filter_text = text.strip().lower()
+        self._apply_filter(self.ap_table)
+        self._apply_filter(self.st_table)
+
+    def _apply_filter(self, table: QTableWidget) -> None:
+        text = self._filter_text
+        for row in range(table.rowCount()):
+            if not text:
+                table.setRowHidden(row, False)
+                continue
+            match = False
+            for col in range(table.columnCount()):
+                item = table.item(row, col)
+                if item and text in item.text().lower():
+                    match = True
+                    break
+            table.setRowHidden(row, not match)
 
     def _set_access_point_row(self, row_idx: int, bssid: str, ap: dict) -> None:
         key_item = QTableWidgetItem(bssid)

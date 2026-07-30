@@ -42,6 +42,7 @@ _MIN_DT = datetime.min.replace(tzinfo=timezone.utc)
 
 class MainWindow(QMainWindow):
     TARGET_STALE_SECONDS = 60
+    AUTO_CAPTURE_TIMEOUT_MS = 45000
 
     def __init__(self, controller: WifiMonitorController, db_path: Optional[Path] = None, capture_dir: Optional[Path] = None) -> None:
         super().__init__()
@@ -53,6 +54,7 @@ class MainWindow(QMainWindow):
         self.station_records: Dict[str, dict] = {}
         self.clients_map: Dict[str, Set[str]] = defaultdict(set)
         self._pmkid_aps: Set[str] = set()
+        self._auto_capture_bssid: Optional[str] = None
         self.db_path = db_path
         self.capture_dir = capture_dir
         # Coalesced GUI refresh: capture callbacks only mark state dirty; the
@@ -76,6 +78,9 @@ class MainWindow(QMainWindow):
         self._relative_timer.setInterval(1000)
         self._relative_timer.timeout.connect(self._on_tick)
         self._relative_timer.start()
+        self._auto_capture_timer = QTimer(self)
+        self._auto_capture_timer.setSingleShot(True)
+        self._auto_capture_timer.timeout.connect(self._on_auto_capture_timeout)
 
     def _setup_ui(self) -> None:
         central = QWidget()
@@ -181,8 +186,11 @@ class MainWindow(QMainWindow):
         buttons_layout = QHBoxLayout()
         self.start_deauth_btn = QPushButton("Запустить деаутентификацию")
         self.stop_deauth_btn = QPushButton("Остановить")
+        self.auto_capture_btn = QPushButton("Авто-захват")
+        self.auto_capture_btn.setToolTip("deauth клиентов → перехват handshake/PMKID → экспорт 22000")
         buttons_layout.addWidget(self.start_deauth_btn)
         buttons_layout.addWidget(self.stop_deauth_btn)
+        buttons_layout.addWidget(self.auto_capture_btn)
         controls_group_layout.addLayout(buttons_layout)
         controls_group.setLayout(controls_group_layout)
 
@@ -260,6 +268,7 @@ class MainWindow(QMainWindow):
         self.refresh_interfaces_btn.clicked.connect(self._on_refresh_interfaces)
         self.start_deauth_btn.clicked.connect(self._on_start_deauth)
         self.stop_deauth_btn.clicked.connect(self._on_stop_deauth)
+        self.auto_capture_btn.clicked.connect(self._on_auto_capture)
         self.target_ap_combo.currentIndexChanged.connect(self._on_target_ap_changed)
         self.controller.access_point_discovered.connect(self._add_access_point)
         self.controller.station_discovered.connect(self._add_station)
@@ -490,6 +499,8 @@ class MainWindow(QMainWindow):
             self._to_text(handshake.get("created_at")),
         ])
         self._auto_resize_table(self.hs_table)
+        if self._auto_capture_bssid and handshake.get("bssid") == self._auto_capture_bssid:
+            self._finish_auto_capture(handshake)
 
     def _append_log(self, message: str) -> None:
         if not hasattr(self, "log_view"):
@@ -922,14 +933,92 @@ class MainWindow(QMainWindow):
             self._show_error(str(exc))
 
     def _on_stop_deauth(self) -> None:
+        self._auto_capture_bssid = None
+        self._auto_capture_timer.stop()
         try:
             self.controller.stop_deauth()
         except Exception as exc:
             self._show_error(str(exc))
 
+    def _on_auto_capture(self) -> None:
+        bssid = self.target_ap_combo.currentData()
+        if not bssid:
+            self._show_error("Выберите точку доступа с активными клиентами")
+            return
+        client_value = self.target_client_combo.currentData()
+        clients = [client_value] if client_value else sorted(self._active_clients_for_ap(bssid))
+        if not clients:
+            self._show_error("Активные клиенты не найдены")
+            return
+        essid = self.ap_records.get(bssid, {}).get("essid") or bssid
+        reply = QMessageBox.question(
+            self,
+            "Авто-захват",
+            f"Запустить авто-захват для сети «{essid}»?\n\n"
+            "Будет выполнена деаутентификация клиентов для получения handshake/PMKID, "
+            "после чего первый захват автоматически экспортируется в hashcat 22000.\n"
+            "Убедитесь, что у вас есть разрешение на тестирование этой сети.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self._save_settings()
+        try:
+            self.controller.start_deauth(
+                bssid,
+                clients,
+                self.deauth_count_spin.value(),
+                self.deauth_interval_spin.value(),
+            )
+        except Exception as exc:
+            self._show_error(str(exc))
+            return
+        self._auto_capture_bssid = bssid
+        self._auto_capture_timer.start(self.AUTO_CAPTURE_TIMEOUT_MS)
+        self.status_bar.showMessage(f"Авто-захват запущен для {essid}", 5000)
+
+    def _finish_auto_capture(self, handshake: dict) -> None:
+        self._auto_capture_timer.stop()
+        bssid = self._auto_capture_bssid
+        self._auto_capture_bssid = None
+        try:
+            self.controller.stop_deauth()
+        except Exception:  # noqa: BLE001 - already stopping, ignore
+            pass
+        kind = handshake.get("kind") or "handshake"
+        capture_path = handshake.get("capture_path")
+        if not capture_path or not self.capture_dir:
+            self.status_bar.showMessage(f"Авто-захват: получен {kind}", 8000)
+            return
+        out = Path(self.capture_dir) / f"{str(bssid or '').replace(':', '')}_{kind}.hc22000"
+
+        def ok(_) -> None:
+            self.status_bar.showMessage(f"Авто-захват: {kind} → {out.name}", 8000)
+
+        self._run_async(
+            lambda: self.controller.export_hashcat(Path(capture_path), out),
+            busy=f"Авто-захват: экспорт {kind}…",
+            on_success=ok,
+            on_error=lambda: self.status_bar.showMessage(
+                f"Авто-захват: {kind} получен, экспорт не удался", 8000
+            ),
+        )
+
+    def _on_auto_capture_timeout(self) -> None:
+        if not self._auto_capture_bssid:
+            return
+        self._auto_capture_bssid = None
+        try:
+            self.controller.stop_deauth()
+        except Exception:  # noqa: BLE001
+            pass
+        self.status_bar.showMessage("Авто-захват: handshake не пойман, остановлено", 8000)
+
     def _on_deauth_state(self, running: bool) -> None:
         self.start_deauth_btn.setEnabled(not running)
         self.stop_deauth_btn.setEnabled(running)
+        self.auto_capture_btn.setEnabled(not running)
 
     def _find_row(self, table: QTableWidget, key: str) -> Optional[int]:
         for row in range(table.rowCount()):

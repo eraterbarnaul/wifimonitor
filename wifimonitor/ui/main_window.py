@@ -1,4 +1,5 @@
-from collections import defaultdict
+import time
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set
@@ -18,6 +19,7 @@ from PyQt5.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QSplitter,
@@ -35,6 +37,7 @@ from ..controller import WifiMonitorController
 from ..detect import find_evil_twins
 from ..oui import lookup_vendor
 from ..timeutil import as_utc, utcnow
+from .locator import RssiPlot
 from .workers import Worker
 
 # Aware "oldest possible" sentinel so rows without a timestamp sort last.
@@ -56,6 +59,8 @@ class MainWindow(QMainWindow):
         self.clients_map: Dict[str, Set[str]] = defaultdict(set)
         self._pmkid_aps: Set[str] = set()
         self._reported_twins: Set[str] = set()
+        self._rssi_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=300))
+        self._locator_keys: List[str] = []
         self._auto_capture_bssid: Optional[str] = None
         self.db_path = db_path
         self.capture_dir = capture_dir
@@ -236,6 +241,40 @@ class MainWindow(QMainWindow):
 
         handshake_tab.setLayout(handshake_layout)
         self.tabs.addTab(handshake_tab, "Перехват")
+
+        locator_tab = QWidget()
+        locator_layout = QVBoxLayout()
+        locator_controls = QHBoxLayout()
+        locator_controls.addWidget(QLabel("Цель:"))
+        self.locator_combo = QComboBox()
+        self.locator_combo.setPlaceholderText("Выберите точку или клиента")
+        locator_controls.addWidget(self.locator_combo, 1)
+        locator_layout.addLayout(locator_controls)
+
+        self.rssi_plot = RssiPlot()
+        plot_group = QGroupBox("Уровень сигнала (RSSI) во времени")
+        plot_group_layout = QVBoxLayout()
+        plot_group_layout.addWidget(self.rssi_plot)
+        plot_group.setLayout(plot_group_layout)
+        locator_layout.addWidget(plot_group)
+
+        readout_row = QHBoxLayout()
+        self.locator_value = QLabel("— dBm")
+        self.locator_value.setStyleSheet("font-size: 26px; font-weight: 600;")
+        self.locator_bar = QProgressBar()
+        self.locator_bar.setRange(0, 100)
+        self.locator_bar.setTextVisible(False)
+        self.locator_trend = QLabel("")
+        self.locator_trend.setStyleSheet("font-size: 18px;")
+        readout_row.addWidget(self.locator_value)
+        readout_row.addWidget(self.locator_bar, 1)
+        readout_row.addWidget(self.locator_trend)
+        locator_layout.addLayout(readout_row)
+        hint = QLabel("Подсказка: двигайтесь по объекту — «теплее» означает приближение к цели.")
+        hint.setWordWrap(True)
+        locator_layout.addWidget(hint)
+        locator_tab.setLayout(locator_layout)
+        self.tabs.addTab(locator_tab, "Локатор")
 
         layout.addWidget(self.tabs)
 
@@ -467,6 +506,7 @@ class MainWindow(QMainWindow):
         if last_seen_dt:
             ap["last_seen_dt"] = last_seen_dt
         self.ap_records[bssid] = {**previous, **ap}
+        self._record_rssi(bssid, ap.get("signal"))
         self._targets_dirty = True
 
     def _add_station(self, station: dict) -> None:
@@ -487,6 +527,7 @@ class MainWindow(QMainWindow):
         self.station_records[mac] = {**previous, **station}
         if bssid:
             self.clients_map[bssid].add(mac)
+        self._record_rssi(mac, station.get("signal"))
         self._targets_dirty = True
 
     def _add_handshake(self, handshake: dict) -> None:
@@ -745,9 +786,63 @@ class MainWindow(QMainWindow):
             self._refresh_targets()
             self._targets_dirty = False
         self._check_evil_twins()
+        self._update_locator()
 
     def _on_security_alert(self, message: str) -> None:
         self.status_bar.showMessage(f"⚠ {message}", 10000)
+
+    def _record_rssi(self, key: str, signal) -> None:
+        if not key or signal is None:
+            return
+        try:
+            self._rssi_history[key].append((time.time(), int(signal)))
+        except (TypeError, ValueError):
+            pass
+
+    def _locator_targets(self) -> List[tuple]:
+        items: List[tuple] = []
+        for bssid, ap in sorted(self.ap_records.items()):
+            essid = ap.get("essid") or bssid
+            items.append((f"AP: {essid} ({bssid})", bssid))
+        for mac in sorted(self.station_records):
+            items.append((f"Клиент: {mac}", mac))
+        return items
+
+    def _update_locator(self) -> None:
+        targets = self._locator_targets()
+        keys = [key for _, key in targets]
+        if keys != self._locator_keys:
+            self._locator_keys = keys
+            current = self.locator_combo.currentData()
+            self.locator_combo.blockSignals(True)
+            self.locator_combo.clear()
+            for label, key in targets:
+                self.locator_combo.addItem(label, key)
+            if current:
+                idx = self.locator_combo.findData(current)
+                if idx >= 0:
+                    self.locator_combo.setCurrentIndex(idx)
+            self.locator_combo.blockSignals(False)
+
+        target = self.locator_combo.currentData()
+        history = list(self._rssi_history.get(target, [])) if target else []
+        self.rssi_plot.set_series(history)
+        if not history:
+            self.locator_value.setText("— dBm")
+            self.locator_bar.setValue(0)
+            self.locator_trend.setText("")
+            return
+        current_rssi = history[-1][1]
+        self.locator_value.setText(f"{current_rssi} dBm")
+        self.locator_bar.setValue(max(0, min(100, int((current_rssi + 90) / 60 * 100))))
+        if len(history) >= 5:
+            delta = current_rssi - history[-5][1]
+            if delta >= 2:
+                self.locator_trend.setText("↑ теплее")
+            elif delta <= -2:
+                self.locator_trend.setText("↓ холоднее")
+            else:
+                self.locator_trend.setText("→ стабильно")
 
     def _check_evil_twins(self) -> None:
         twins = find_evil_twins(self.ap_records.values())

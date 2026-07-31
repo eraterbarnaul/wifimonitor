@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Set
 from PyQt5.QtCore import QObject, pyqtSignal
 
 from .capture import MonitorService
+from .crack import CrackService
 from .csv_export import CsvExporter
 from .database import DatabaseManager
 from .exporters import ExcelExporter, HashcatExporter
@@ -35,6 +36,8 @@ class WifiMonitorController(QObject):
     probe_discovered = pyqtSignal(dict)
     wps_state_changed = pyqtSignal(bool)
     wps_cracked = pyqtSignal(dict)
+    crack_state_changed = pyqtSignal(bool)
+    crack_cracked = pyqtSignal(dict)
 
     def __init__(self, db_path: Path, capture_dir: Path) -> None:
         super().__init__()
@@ -55,6 +58,7 @@ class WifiMonitorController(QObject):
         self._state_lock = threading.Lock()
         self.deauth_service: Optional[DeauthService] = None
         self.wps_service: Optional[WpsAttackService] = None
+        self.crack_service: Optional[CrackService] = None
         self._log("Контроллер инициализирован")
 
     def set_interface(self, interface: str) -> None:
@@ -106,6 +110,8 @@ class WifiMonitorController(QObject):
         self.stop_deauth()
         if self.wps_service and self.wps_service.is_running():
             self.stop_wps_attack()
+        if self.crack_service and self.crack_service.is_running():
+            self.stop_crack()
         try:
             self.interface_manager.disable_monitor_mode()
         except Exception as exc:  # noqa: BLE001
@@ -267,6 +273,28 @@ class WifiMonitorController(QObject):
             parts.append(f"PSK {result['psk']}")
         self._log("WPS результат: " + ", ".join(parts))
         self.wps_cracked.emit(result)
+
+    def start_crack(self, capture_path: str, bssid: str, wordlist: str) -> None:
+        if self.crack_service and self.crack_service.is_running():
+            self.crack_service.stop()
+        self.crack_service = CrackService(
+            log_callback=self._log,
+            on_progress=lambda p: self.status_changed.emit(f"Крекинг: {p}"),
+            on_result=self._handle_crack_result,
+        )
+        self.crack_service.start(capture_path, bssid, wordlist)
+        self.crack_state_changed.emit(True)
+        self.status_changed.emit(f"Крекинг запущен для {bssid}")
+
+    def stop_crack(self) -> None:
+        if self.crack_service:
+            self.crack_service.stop()
+        self.crack_state_changed.emit(False)
+        self.status_changed.emit("Крекинг остановлен")
+
+    def _handle_crack_result(self, result: dict) -> None:
+        self.crack_cracked.emit(result)
+        self.crack_state_changed.emit(False)
 
     def request_pmkid(self, bssid: str) -> None:
         if not self.monitor_service or not self.monitor_service.is_running():

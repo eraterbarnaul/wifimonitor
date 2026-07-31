@@ -296,10 +296,15 @@ class MainWindow(QMainWindow):
         self.export_csv_btn = QPushButton("Экспорт CSV")
         self.export_report_btn = QPushButton("Отчёт HTML")
         self.export_hashcat_btn = QPushButton("Экспорт Hashcat")
+        self.crack_btn = QPushButton("Взломать (словарь)")
+        self.crack_stop_btn = QPushButton("Стоп взлом")
+        self.crack_stop_btn.setEnabled(False)
         export_layout.addWidget(self.export_excel_btn)
         export_layout.addWidget(self.export_csv_btn)
         export_layout.addWidget(self.export_report_btn)
         export_layout.addWidget(self.export_hashcat_btn)
+        export_layout.addWidget(self.crack_btn)
+        export_layout.addWidget(self.crack_stop_btn)
         export_layout.addStretch()
         layout.addLayout(export_layout)
 
@@ -339,6 +344,10 @@ class MainWindow(QMainWindow):
         self.wps_attack_btn.clicked.connect(self._on_wps_attack)
         self.wps_stop_btn.clicked.connect(self._on_wps_stop)
         self.pmkid_request_btn.clicked.connect(self._on_request_pmkid)
+        self.crack_btn.clicked.connect(self._on_crack)
+        self.crack_stop_btn.clicked.connect(self._on_crack_stop)
+        self.controller.crack_state_changed.connect(self._on_crack_state)
+        self.controller.crack_cracked.connect(self._on_crack_cracked)
 
     def _populate_from_db(self) -> None:
         for ap in self.controller.load_access_points():
@@ -876,6 +885,41 @@ class MainWindow(QMainWindow):
         if result.get("psk"):
             parts.append(f"PSK: {result['psk']}")
         QMessageBox.information(self, "WPS результат", "\n".join(parts) or "Результат получен")
+
+    def _on_crack(self) -> None:
+        row = self.hs_table.currentRow()
+        if row < 0:
+            self._show_error("Выберите handshake в таблице")
+            return
+        bssid_item = self.hs_table.item(row, 0)
+        path_item = self.hs_table.item(row, 3)
+        if not bssid_item or not path_item:
+            self._show_error("Не найден BSSID или файл захвата")
+            return
+        bssid = bssid_item.text()
+        capture_path = path_item.text()
+        wordlist, _ = QFileDialog.getOpenFileName(
+            self, "Выберите словарь", "", "Словари (*.txt *.lst *.dic);;Все файлы (*)"
+        )
+        if not wordlist:
+            return
+        self.crack_btn.setEnabled(False)
+        self._run_async(
+            lambda: self.controller.start_crack(capture_path, bssid, wordlist),
+            busy="Запуск крекинга…",
+            on_error=lambda: self.crack_btn.setEnabled(True),
+        )
+
+    def _on_crack_stop(self) -> None:
+        self._run_async(self.controller.stop_crack, busy="Остановка крекинга…")
+
+    def _on_crack_state(self, running: bool) -> None:
+        self.crack_btn.setEnabled(not running)
+        self.crack_stop_btn.setEnabled(running)
+
+    def _on_crack_cracked(self, result: dict) -> None:
+        key = result.get("key", "")
+        QMessageBox.information(self, "Пароль найден", f"Пароль: {key}" if key else "Пароль найден")
 
     def _on_request_pmkid(self) -> None:
         bssid = self._selected_ap_bssid()

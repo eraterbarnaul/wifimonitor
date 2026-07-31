@@ -25,5 +25,8 @@ wifimonitor-cli = "wifimonitor.cli:main"
 [tool.setuptools.packages.find]
 include = ["wifimonitor*"]
 
+[tool.setuptools.package-data]
+wifimonitor = ["ui/styles/*.qss"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

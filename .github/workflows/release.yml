@@ -28,6 +28,9 @@ jobs:
           python -m pip install --upgrade build
           python -m build
 
+      - name: Build .deb package
+        run: bash packaging/build_deb.sh "${GITHUB_REF_NAME#v}"
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:

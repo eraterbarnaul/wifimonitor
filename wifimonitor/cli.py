@@ -41,6 +41,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--secondary", default="",
         help="secondary interface for injection (dual-adapter mode)",
     )
+    parser.add_argument(
+        "--api", action="store_true",
+        help="start the REST API server (remote control + web UI) instead of auto-capturing",
+    )
+    parser.add_argument(
+        "--api-host", default="127.0.0.1",
+        help="REST API bind host (default: 127.0.0.1; use 0.0.0.0 to expose — no auth!)",
+    )
+    parser.add_argument("--api-port", type=int, default=8080, help="REST API port (default: 8080)")
     return parser
 
 
@@ -82,8 +91,16 @@ def run(args: argparse.Namespace) -> int:
         uc.interface_manager.monitor_interface = args.interface
         uc.interface_manager._auto_started = False
 
-    log.info("headless capture on %s", args.interface)
-    uc.start_capture()
+    server = None
+    if args.api:
+        from .rest_api import RestApiServer
+
+        server = RestApiServer(uc, host=args.api_host, port=args.api_port)
+        server.start()
+        log.info("REST API on %s (web UI at /) — control capture via the API", server.url)
+    else:
+        log.info("headless capture on %s", args.interface)
+        uc.start_capture()
 
     deadline = time.time() + args.duration if args.duration > 0 else None
     try:
@@ -94,6 +111,8 @@ def run(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         log.info("interrupted")
     finally:
+        if server is not None:
+            server.stop()
         uc.stop_capture()
 
     log.info("captured %d handshake(s)", counters["handshakes"])

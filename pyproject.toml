@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wifimonitor"
+version = "1.0.0"
+description = "PyQt5 GUI for passive Wi-Fi monitoring, WPA handshake capture and export"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "scapy>=2.5.0",
+    "PyQt5>=5.15.0",
+    "openpyxl>=3.1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+wifimonitor = "wifimonitor.app:main"
+wifimonitor-cli = "wifimonitor.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["wifimonitor*"]
+
+[tool.setuptools.package-data]
+wifimonitor = ["ui/styles/*.qss"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

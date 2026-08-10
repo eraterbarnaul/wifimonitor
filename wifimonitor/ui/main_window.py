@@ -1,11 +1,13 @@
-from collections import defaultdict
-from datetime import datetime, timedelta
+import time
+from collections import defaultdict, deque
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QSettings, QThreadPool, QTimer
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
+    QAbstractItemView,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -13,9 +15,11 @@ from PyQt5.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QSplitter,
@@ -28,33 +32,63 @@ from PyQt5.QtWidgets import (
     QHeaderView,
 )
 
+from ..audit import assess, priority_rank
 from ..controller import WifiMonitorController
+from ..detect import find_evil_twins
+from ..oui import is_randomized_mac, lookup_vendor
+from ..timeutil import as_utc, utcnow
+from .locator import RssiPlot
+from .workers import Worker
+
+# Aware "oldest possible" sentinel so rows without a timestamp sort last.
+_MIN_DT = datetime.min.replace(tzinfo=timezone.utc)
 
 
 class MainWindow(QMainWindow):
     TARGET_STALE_SECONDS = 60
+    AUTO_CAPTURE_TIMEOUT_MS = 45000
 
     def __init__(self, controller: WifiMonitorController, db_path: Optional[Path] = None, capture_dir: Optional[Path] = None) -> None:
         super().__init__()
         self.controller = controller
         self.setWindowTitle("Wifimonitor")
         self.resize(1200, 800)
+        self.setMinimumSize(960, 640)
         self.ap_records: Dict[str, dict] = {}
         self.station_records: Dict[str, dict] = {}
         self.clients_map: Dict[str, Set[str]] = defaultdict(set)
+        self._pmkid_aps: Set[str] = set()
+        self._reported_twins: Set[str] = set()
+        self._rssi_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=300))
+        self._locator_keys: List[str] = []
+        self._pnl: Dict[str, Set[str]] = defaultdict(set)
+        self._auto_capture_bssid: Optional[str] = None
         self.db_path = db_path
         self.capture_dir = capture_dir
+        # Coalesced GUI refresh: capture callbacks only mark state dirty; the
+        # periodic tick redraws the tables so a busy sniffer can't flood the UI.
+        self._targets_dirty = False
+        self._capture_running = False
+        self._filter_text = ""
+        self._ap_sort_col = 7  # "Обновлено" by default
+        self._ap_sort_desc = True
+        self._pool = QThreadPool.globalInstance()
+        self._active_workers: Set[Worker] = set()
+        self._settings = QSettings("wifimonitor", "wifimonitor")
         self._setup_ui()
         self._connect_signals()
         self._populate_from_db()
         self._on_deauth_state(False)
-        self._refresh_targets()
+        self._restore_settings()
         self.controller.refresh_interfaces()
         self._announce_storage()
         self._relative_timer = QTimer(self)
         self._relative_timer.setInterval(1000)
-        self._relative_timer.timeout.connect(self._refresh_relative_rows)
+        self._relative_timer.timeout.connect(self._on_tick)
         self._relative_timer.start()
+        self._auto_capture_timer = QTimer(self)
+        self._auto_capture_timer.setSingleShot(True)
+        self._auto_capture_timer.timeout.connect(self._on_auto_capture_timeout)
 
     def _setup_ui(self) -> None:
         central = QWidget()
@@ -74,6 +108,7 @@ class MainWindow(QMainWindow):
         self.disable_monitor_btn = QPushButton("Выключить монитор")
         self.start_capture_btn = QPushButton("Старт")
         self.stop_capture_btn = QPushButton("Стоп")
+        self.stop_capture_btn.setEnabled(False)
 
         for btn in [
             self.refresh_interfaces_btn,
@@ -90,12 +125,23 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         monitor_tab = QWidget()
         monitor_layout = QVBoxLayout()
+
+        search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("Поиск:"))
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Фильтр по BSSID, ESSID или MAC")
+        self.search_edit.setClearButtonEnabled(True)
+        search_row.addWidget(self.search_edit)
+        monitor_layout.addLayout(search_row)
+
         splitter = QSplitter(Qt.Vertical)
 
-        self.ap_table = QTableWidget(0, 8)
-        self.ap_table.setHorizontalHeaderLabels(["№", "BSSID", "ESSID", "Канал", "Шифрование", "Сигнал", "Клиенты", "Обновлено"])
+        self.ap_table = QTableWidget(0, 9)
+        self.ap_table.setHorizontalHeaderLabels(["№", "BSSID", "ESSID", "Канал", "Шифрование", "Сигнал", "Клиенты", "Обновлено", "Оценка"])
         self.ap_table.horizontalHeader().setStretchLastSection(True)
         self.ap_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.ap_table.horizontalHeader().setSectionsClickable(True)
+        self.ap_table.horizontalHeader().sectionClicked.connect(self._on_ap_header_clicked)
         ap_group = QGroupBox("Точки доступа")
         ap_layout = QVBoxLayout()
         ap_layout.addWidget(self.ap_table)
@@ -113,6 +159,18 @@ class MainWindow(QMainWindow):
         splitter.addWidget(st_group)
 
         monitor_layout.addWidget(splitter)
+
+        attacks_row = QHBoxLayout()
+        self.wps_attack_btn = QPushButton("WPS-атака")
+        self.wps_stop_btn = QPushButton("Стоп WPS")
+        self.wps_stop_btn.setEnabled(False)
+        self.pmkid_request_btn = QPushButton("Запросить PMKID")
+        attacks_row.addWidget(QLabel("Выбранная точка:"))
+        attacks_row.addWidget(self.wps_attack_btn)
+        attacks_row.addWidget(self.wps_stop_btn)
+        attacks_row.addWidget(self.pmkid_request_btn)
+        attacks_row.addStretch()
+        monitor_layout.addLayout(attacks_row)
         monitor_tab.setLayout(monitor_layout)
         self.tabs.addTab(monitor_tab, "Мониторинг")
 
@@ -148,8 +206,11 @@ class MainWindow(QMainWindow):
         buttons_layout = QHBoxLayout()
         self.start_deauth_btn = QPushButton("Запустить деаутентификацию")
         self.stop_deauth_btn = QPushButton("Остановить")
+        self.auto_capture_btn = QPushButton("Авто-захват")
+        self.auto_capture_btn.setToolTip("deauth клиентов → перехват handshake/PMKID → экспорт 22000")
         buttons_layout.addWidget(self.start_deauth_btn)
         buttons_layout.addWidget(self.stop_deauth_btn)
+        buttons_layout.addWidget(self.auto_capture_btn)
         controls_group_layout.addLayout(buttons_layout)
         controls_group.setLayout(controls_group_layout)
 
@@ -157,8 +218,8 @@ class MainWindow(QMainWindow):
 
         handshake_group = QGroupBox("Пойманные handshakes")
         handshake_group_layout = QVBoxLayout()
-        self.hs_table = QTableWidget(0, 4)
-        self.hs_table.setHorizontalHeaderLabels(["BSSID", "Клиент", "Файл", "Создан"])
+        self.hs_table = QTableWidget(0, 6)
+        self.hs_table.setHorizontalHeaderLabels(["BSSID", "Клиент", "Тип", "Файл", "Создан", "Качество"])
         self.hs_table.horizontalHeader().setStretchLastSection(True)
         self.hs_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         font = QFont("Fira Code", 10)
@@ -171,6 +232,12 @@ class MainWindow(QMainWindow):
         self.hs_table.setFont(font)
         self.hs_table.horizontalHeader().setFont(font)
         self.hs_table.verticalHeader().setFont(font)
+        for table in (self.ap_table, self.st_table, self.hs_table):
+            table.setSelectionBehavior(QAbstractItemView.SelectRows)
+            table.setSelectionMode(QAbstractItemView.SingleSelection)
+            table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            table.setAlternatingRowColors(True)
+            table.verticalHeader().setVisible(False)
         handshake_group_layout.addWidget(self.hs_table)
         handshake_group.setLayout(handshake_group_layout)
         handshake_layout.addWidget(handshake_group)
@@ -188,13 +255,56 @@ class MainWindow(QMainWindow):
         handshake_tab.setLayout(handshake_layout)
         self.tabs.addTab(handshake_tab, "Перехват")
 
+        locator_tab = QWidget()
+        locator_layout = QVBoxLayout()
+        locator_controls = QHBoxLayout()
+        locator_controls.addWidget(QLabel("Цель:"))
+        self.locator_combo = QComboBox()
+        self.locator_combo.setPlaceholderText("Выберите точку или клиента")
+        locator_controls.addWidget(self.locator_combo, 1)
+        locator_layout.addLayout(locator_controls)
+
+        self.rssi_plot = RssiPlot()
+        plot_group = QGroupBox("Уровень сигнала (RSSI) во времени")
+        plot_group_layout = QVBoxLayout()
+        plot_group_layout.addWidget(self.rssi_plot)
+        plot_group.setLayout(plot_group_layout)
+        locator_layout.addWidget(plot_group)
+
+        readout_row = QHBoxLayout()
+        self.locator_value = QLabel("— dBm")
+        self.locator_value.setStyleSheet("font-size: 26px; font-weight: 600;")
+        self.locator_bar = QProgressBar()
+        self.locator_bar.setRange(0, 100)
+        self.locator_bar.setTextVisible(False)
+        self.locator_trend = QLabel("")
+        self.locator_trend.setStyleSheet("font-size: 18px;")
+        readout_row.addWidget(self.locator_value)
+        readout_row.addWidget(self.locator_bar, 1)
+        readout_row.addWidget(self.locator_trend)
+        locator_layout.addLayout(readout_row)
+        hint = QLabel("Подсказка: двигайтесь по объекту — «теплее» означает приближение к цели.")
+        hint.setWordWrap(True)
+        locator_layout.addWidget(hint)
+        locator_tab.setLayout(locator_layout)
+        self.tabs.addTab(locator_tab, "Локатор")
+
         layout.addWidget(self.tabs)
 
         export_layout = QHBoxLayout()
         self.export_excel_btn = QPushButton("Экспорт Excel")
+        self.export_csv_btn = QPushButton("Экспорт CSV")
+        self.export_report_btn = QPushButton("Отчёт HTML")
         self.export_hashcat_btn = QPushButton("Экспорт Hashcat")
+        self.crack_btn = QPushButton("Взломать (словарь)")
+        self.crack_stop_btn = QPushButton("Стоп взлом")
+        self.crack_stop_btn.setEnabled(False)
         export_layout.addWidget(self.export_excel_btn)
+        export_layout.addWidget(self.export_csv_btn)
+        export_layout.addWidget(self.export_report_btn)
         export_layout.addWidget(self.export_hashcat_btn)
+        export_layout.addWidget(self.crack_btn)
+        export_layout.addWidget(self.crack_stop_btn)
         export_layout.addStretch()
         layout.addLayout(export_layout)
 
@@ -210,10 +320,14 @@ class MainWindow(QMainWindow):
         self.start_capture_btn.clicked.connect(self._on_start_capture)
         self.stop_capture_btn.clicked.connect(self._on_stop_capture)
         self.export_excel_btn.clicked.connect(self._on_export_excel)
+        self.export_csv_btn.clicked.connect(self._on_export_csv)
+        self.export_report_btn.clicked.connect(self._on_export_report)
         self.export_hashcat_btn.clicked.connect(self._on_export_hashcat)
+        self.search_edit.textChanged.connect(self._on_search_changed)
         self.refresh_interfaces_btn.clicked.connect(self._on_refresh_interfaces)
         self.start_deauth_btn.clicked.connect(self._on_start_deauth)
         self.stop_deauth_btn.clicked.connect(self._on_stop_deauth)
+        self.auto_capture_btn.clicked.connect(self._on_auto_capture)
         self.target_ap_combo.currentIndexChanged.connect(self._on_target_ap_changed)
         self.controller.access_point_discovered.connect(self._add_access_point)
         self.controller.station_discovered.connect(self._add_station)
@@ -223,6 +337,17 @@ class MainWindow(QMainWindow):
         self.controller.interface_list_changed.connect(self._populate_interfaces)
         self.controller.deauth_state_changed.connect(self._on_deauth_state)
         self.controller.log_generated.connect(self._append_log)
+        self.controller.security_alert.connect(self._on_security_alert)
+        self.controller.probe_discovered.connect(self._on_probe)
+        self.controller.wps_state_changed.connect(self._on_wps_state)
+        self.controller.wps_cracked.connect(self._on_wps_cracked)
+        self.wps_attack_btn.clicked.connect(self._on_wps_attack)
+        self.wps_stop_btn.clicked.connect(self._on_wps_stop)
+        self.pmkid_request_btn.clicked.connect(self._on_request_pmkid)
+        self.crack_btn.clicked.connect(self._on_crack)
+        self.crack_stop_btn.clicked.connect(self._on_crack_stop)
+        self.controller.crack_state_changed.connect(self._on_crack_state)
+        self.controller.crack_cracked.connect(self._on_crack_cracked)
 
     def _populate_from_db(self) -> None:
         for ap in self.controller.load_access_points():
@@ -231,7 +356,10 @@ class MainWindow(QMainWindow):
             self._add_station(station)
         for handshake in self.controller.load_handshakes():
             self._add_handshake(handshake)
+        self._rebuild_access_point_table()
+        self._rebuild_station_table()
         self._refresh_targets()
+        self._targets_dirty = False
 
     def _on_set_interface(self) -> None:
         interface = self.interface_combo.currentText().strip()
@@ -239,48 +367,140 @@ class MainWindow(QMainWindow):
             self._show_error("Укажите интерфейс")
             return
         self.controller.set_interface(interface)
+        self._save_settings()
         self.status_bar.showMessage(f"Выбран интерфейс {interface}")
 
+    def _run_async(self, fn, *, busy=None, on_success=None, on_error=None) -> None:
+        """Run ``fn`` in a pool thread so the GUI stays responsive.
+
+        ``on_success(result)`` and ``on_error()`` run back on the GUI thread.
+        The worker is kept referenced until it finishes so its queued signals
+        are not dropped.
+        """
+        if busy:
+            self.status_bar.showMessage(busy)
+        worker = Worker(fn)
+        worker.setAutoDelete(False)
+        self._active_workers.add(worker)
+
+        def _done(result) -> None:
+            self._active_workers.discard(worker)
+            if on_success is not None:
+                on_success(result)
+
+        def _fail(message: str) -> None:
+            self._active_workers.discard(worker)
+            if on_error is not None:
+                on_error()
+            self._show_error(message)
+
+        worker.signals.finished.connect(_done)
+        worker.signals.failed.connect(_fail)
+        self._pool.start(worker)
+
     def _on_enable_monitor(self) -> None:
-        try:
-            self.controller.enable_monitor_mode()
-        except Exception as exc:
-            self._show_error(str(exc))
+        self.enable_monitor_btn.setEnabled(False)
+        self._run_async(
+            self.controller.enable_monitor_mode,
+            busy="Включение мониторного режима…",
+            on_success=lambda _: self.enable_monitor_btn.setEnabled(True),
+            on_error=lambda: self.enable_monitor_btn.setEnabled(True),
+        )
 
     def _on_disable_monitor(self) -> None:
-        try:
-            self.controller.disable_monitor_mode()
-        except Exception as exc:
-            self._show_error(str(exc))
+        self.disable_monitor_btn.setEnabled(False)
+        self._run_async(
+            self.controller.disable_monitor_mode,
+            busy="Выключение мониторного режима…",
+            on_success=lambda _: self.disable_monitor_btn.setEnabled(True),
+            on_error=lambda: self.disable_monitor_btn.setEnabled(True),
+        )
 
     def _on_start_capture(self) -> None:
-        try:
-            self.controller.start_capture()
-        except Exception as exc:
-            self._show_error(str(exc))
+        self.start_capture_btn.setEnabled(False)
+
+        def ok(_) -> None:
+            self._capture_running = True
+            self.stop_capture_btn.setEnabled(True)
+
+        self._run_async(
+            self.controller.start_capture,
+            busy="Запуск захвата…",
+            on_success=ok,
+            on_error=lambda: self.start_capture_btn.setEnabled(True),
+        )
 
     def _on_stop_capture(self) -> None:
-        try:
-            self.controller.stop_capture()
-        except Exception as exc:
-            self._show_error(str(exc))
+        self.stop_capture_btn.setEnabled(False)
+
+        def ok(_) -> None:
+            self._capture_running = False
+            self.start_capture_btn.setEnabled(True)
+
+        self._run_async(
+            self.controller.stop_capture,
+            busy="Остановка захвата…",
+            on_success=ok,
+            on_error=lambda: self.stop_capture_btn.setEnabled(True),
+        )
 
     def _on_export_excel(self) -> None:
         destination, _ = QFileDialog.getSaveFileName(self, "Сохранить Excel", "results.xlsx", "Excel (*.xlsx)")
         if not destination:
             return
-        try:
-            self.controller.export_excel(Path(destination))
+        self.export_excel_btn.setEnabled(False)
+
+        def ok(_) -> None:
+            self.export_excel_btn.setEnabled(True)
             self.status_bar.showMessage("Экспорт Excel выполнен", 5000)
-        except Exception as exc:
-            self._show_error(str(exc))
+
+        self._run_async(
+            lambda: self.controller.export_excel(Path(destination)),
+            busy="Экспорт в Excel…",
+            on_success=ok,
+            on_error=lambda: self.export_excel_btn.setEnabled(True),
+        )
+
+    def _on_export_csv(self) -> None:
+        destination, _ = QFileDialog.getSaveFileName(self, "Сохранить CSV", "networks.csv", "CSV (*.csv)")
+        if not destination:
+            return
+        self.export_csv_btn.setEnabled(False)
+
+        def ok(clients_path) -> None:
+            self.export_csv_btn.setEnabled(True)
+            self.status_bar.showMessage(f"CSV сохранён (клиенты: {Path(clients_path).name})", 5000)
+
+        self._run_async(
+            lambda: self.controller.export_csv(Path(destination)),
+            busy="Экспорт в CSV…",
+            on_success=ok,
+            on_error=lambda: self.export_csv_btn.setEnabled(True),
+        )
+
+    def _on_export_report(self) -> None:
+        destination, _ = QFileDialog.getSaveFileName(self, "Сохранить отчёт", "report.html", "HTML (*.html)")
+        if not destination:
+            return
+        self.export_report_btn.setEnabled(False)
+
+        def ok(_) -> None:
+            self.export_report_btn.setEnabled(True)
+            self.status_bar.showMessage("Отчёт HTML сохранён", 5000)
+
+        self._run_async(
+            lambda: self.controller.export_report(Path(destination)),
+            busy="Формирование отчёта…",
+            on_success=ok,
+            on_error=lambda: self.export_report_btn.setEnabled(True),
+        )
 
     def _on_export_hashcat(self) -> None:
         row = self.hs_table.currentRow()
         if row < 0:
             self._show_error("Выберите handshake")
             return
-        capture_path_item = self.hs_table.item(row, 2)
+        capture_path_item = self.hs_table.item(row, 3)
         if not capture_path_item:
             self._show_error("Не найден путь к файлу")
             return
@@ -288,11 +508,18 @@ class MainWindow(QMainWindow):
         destination, _ = QFileDialog.getSaveFileName(self, "Сохранить Hashcat", f"{capture_path.stem}.hc22000", "Hashcat (*.hc22000)")
         if not destination:
             return
-        try:
-            self.controller.export_hashcat(capture_path, Path(destination))
+        self.export_hashcat_btn.setEnabled(False)
+
+        def ok(_) -> None:
+            self.export_hashcat_btn.setEnabled(True)
             self.status_bar.showMessage("Экспорт Hashcat выполнен", 5000)
-        except Exception as exc:
-            self._show_error(str(exc))
+
+        self._run_async(
+            lambda: self.controller.export_hashcat(capture_path, Path(destination)),
+            busy="Экспорт в Hashcat…",
+            on_success=ok,
+            on_error=lambda: self.export_hashcat_btn.setEnabled(True),
+        )
 
     def _add_access_point(self, ap: dict) -> None:
         ap = dict(ap)
@@ -307,8 +534,8 @@ class MainWindow(QMainWindow):
         if last_seen_dt:
             ap["last_seen_dt"] = last_seen_dt
         self.ap_records[bssid] = {**previous, **ap}
-        self._rebuild_access_point_table()
-        self._refresh_targets()
+        self._record_rssi(bssid, ap.get("signal"))
+        self._targets_dirty = True
 
     def _add_station(self, station: dict) -> None:
         station = dict(station)
@@ -328,20 +555,25 @@ class MainWindow(QMainWindow):
         self.station_records[mac] = {**previous, **station}
         if bssid:
             self.clients_map[bssid].add(mac)
-        self._rebuild_station_table()
-        if bssid:
-            self._rebuild_access_point_table()
-            self._refresh_targets()
+        self._record_rssi(mac, station.get("signal"))
+        self._targets_dirty = True
 
     def _add_handshake(self, handshake: dict) -> None:
-        key = f"{handshake.get('bssid')}->{handshake.get('station_mac')}"
+        kind = handshake.get("kind") or "handshake"
+        if kind == "pmkid" and handshake.get("bssid"):
+            self._pmkid_aps.add(handshake["bssid"])
+        key = f"{handshake.get('bssid')}->{handshake.get('station_mac')}:{kind}"
         self._update_row(self.hs_table, key, [
             self._to_text(handshake.get("bssid")),
             self._to_text(handshake.get("station_mac")),
+            self._to_text(kind),
             self._to_text(handshake.get("capture_path")),
             self._to_text(handshake.get("created_at")),
+            self._to_text(handshake.get("quality")),
         ])
         self._auto_resize_table(self.hs_table)
+        if self._auto_capture_bssid and handshake.get("bssid") == self._auto_capture_bssid:
+            self._finish_auto_capture(handshake)
 
     def _append_log(self, message: str) -> None:
         if not hasattr(self, "log_view"):
@@ -386,27 +618,104 @@ class MainWindow(QMainWindow):
             return ""
         return str(value)
 
+    def _current_row_key(self, table: QTableWidget) -> Optional[str]:
+        row = table.currentRow()
+        if row < 0:
+            return None
+        header = table.verticalHeaderItem(row)
+        return header.data(Qt.UserRole) if header else None
+
+    def _restore_row_key(self, table: QTableWidget, key: Optional[str]) -> None:
+        if not key:
+            return
+        row = self._find_row(table, key)
+        if row is not None:
+            table.setCurrentCell(row, 0)
+
+    def _ap_sort_key(self, item):
+        bssid, ap = item
+        col = self._ap_sort_col
+        if col == 1:
+            return (ap.get("bssid") or "").lower()
+        if col == 2:
+            return (ap.get("essid") or "").lower()
+        if col == 3:
+            return ap.get("channel") or 0
+        if col == 4:
+            return (ap.get("encryption") or "").lower()
+        if col == 5:
+            signal = ap.get("signal")
+            return signal if signal is not None else -9999
+        if col == 6:
+            return len(self._active_clients_for_ap(bssid))
+        if col == 8:
+            label, _ = assess(
+                ap.get("encryption"),
+                wps=bool(ap.get("wps")),
+                mfp_required=bool(ap.get("mfp_required")),
+                signal=ap.get("signal"),
+                client_count=len(self._active_clients_for_ap(bssid)),
+                has_pmkid=bssid in self._pmkid_aps,
+            )
+            return priority_rank(label)
+        return ap.get("last_seen_dt") or _MIN_DT
+
+    def _on_ap_header_clicked(self, col: int) -> None:
+        if col == 0:  # the row-number column is not a sort key
+            return
+        if col == self._ap_sort_col:
+            self._ap_sort_desc = not self._ap_sort_desc
+        else:
+            self._ap_sort_col = col
+            self._ap_sort_desc = col in (5, 6, 7, 8)  # signal/clients/last-seen/verdict default to desc
+        self._rebuild_access_point_table()
+
     def _rebuild_access_point_table(self) -> None:
-        rows = sorted(
-            self.ap_records.items(),
-            key=lambda item: item[1].get("last_seen_dt") or datetime.min,
-            reverse=True,
-        )
+        key = self._current_row_key(self.ap_table)
+        self.ap_table.setUpdatesEnabled(False)
+        rows = sorted(self.ap_records.items(), key=self._ap_sort_key, reverse=self._ap_sort_desc)
         self.ap_table.setRowCount(len(rows))
         for row_idx, (bssid, ap) in enumerate(rows):
             self._set_access_point_row(row_idx, bssid, ap)
         self._auto_resize_table(self.ap_table)
+        self._apply_filter(self.ap_table)
+        self.ap_table.setUpdatesEnabled(True)
+        self._restore_row_key(self.ap_table, key)
 
     def _rebuild_station_table(self) -> None:
+        key = self._current_row_key(self.st_table)
+        self.st_table.setUpdatesEnabled(False)
         rows = sorted(
             self.station_records.items(),
-            key=lambda item: item[1].get("last_seen_dt") or datetime.min,
+            key=lambda item: item[1].get("last_seen_dt") or _MIN_DT,
             reverse=True,
         )
         self.st_table.setRowCount(len(rows))
         for row_idx, (mac, station) in enumerate(rows):
             self._set_station_row(row_idx, mac, station)
         self._auto_resize_table(self.st_table)
+        self._apply_filter(self.st_table)
+        self.st_table.setUpdatesEnabled(True)
+        self._restore_row_key(self.st_table, key)
+
+    def _on_search_changed(self, text: str) -> None:
+        self._filter_text = text.strip().lower()
+        self._apply_filter(self.ap_table)
+        self._apply_filter(self.st_table)
+
+    def _apply_filter(self, table: QTableWidget) -> None:
+        text = self._filter_text
+        for row in range(table.rowCount()):
+            if not text:
+                table.setRowHidden(row, False)
+                continue
+            match = False
+            for col in range(table.columnCount()):
+                item = table.item(row, col)
+                if item and text in item.text().lower():
+                    match = True
+                    break
+            table.setRowHidden(row, not match)
 
     def _set_access_point_row(self, row_idx: int, bssid: str, ap: dict) -> None:
         key_item = QTableWidgetItem(bssid)
@@ -421,6 +730,9 @@ class MainWindow(QMainWindow):
 
         bssid_item = QTableWidgetItem(self._to_text(ap.get("bssid")))
         bssid_item.setFlags(bssid_item.flags() & ~Qt.ItemIsEditable)
+        vendor = lookup_vendor(bssid)
+        if vendor:
+            bssid_item.setToolTip(f"Производитель: {vendor}")
         self.ap_table.setItem(row_idx, 1, bssid_item)
 
         essid_item = QTableWidgetItem(self._to_text(ap.get("essid")))
@@ -453,6 +765,20 @@ class MainWindow(QMainWindow):
         last_seen_item.setData(Qt.UserRole, last_seen_dt.timestamp() if last_seen_dt else float("-inf"))
         self.ap_table.setItem(row_idx, 7, last_seen_item)
 
+        label, detail = assess(
+            ap.get("encryption"),
+            wps=bool(ap.get("wps")),
+            mfp_required=bool(ap.get("mfp_required")),
+            signal=ap.get("signal"),
+            client_count=active_clients,
+            has_pmkid=bssid in self._pmkid_aps,
+        )
+        verdict_item = QTableWidgetItem(label)
+        verdict_item.setFlags(verdict_item.flags() & ~Qt.ItemIsEditable)
+        verdict_item.setToolTip(detail)
+        verdict_item.setData(Qt.UserRole, priority_rank(label))
+        self.ap_table.setItem(row_idx, 8, verdict_item)
+
     def _set_station_row(self, row_idx: int, mac: str, station: dict) -> None:
         key_item = QTableWidgetItem(mac)
         key_item.setData(Qt.UserRole, mac)
@@ -461,6 +787,17 @@ class MainWindow(QMainWindow):
 
         mac_item = QTableWidgetItem(self._to_text(station.get("mac")))
         mac_item.setFlags(mac_item.flags() & ~Qt.ItemIsEditable)
+        tips = []
+        vendor = lookup_vendor(mac)
+        if vendor:
+            tips.append(f"Производитель: {vendor}")
+        if is_randomized_mac(mac):
+            tips.append("MAC рандомизирован")
+        pnl = sorted(self._pnl.get(mac, ()))
+        if pnl:
+            tips.append("Ищет сети: " + ", ".join(pnl))
+        if tips:
+            mac_item.setToolTip("\n".join(tips))
         self.st_table.setItem(row_idx, 0, mac_item)
 
         bssid_item = QTableWidgetItem(self._to_text(station.get("associated_bssid")))
@@ -478,9 +815,199 @@ class MainWindow(QMainWindow):
         last_seen_item.setData(Qt.UserRole, last_seen_dt.timestamp() if last_seen_dt else float("-inf"))
         self.st_table.setItem(row_idx, 3, last_seen_item)
 
-    def _refresh_relative_rows(self) -> None:
+    def _on_tick(self) -> None:
+        # Runs once per second: redraw tables so relative "last seen" values
+        # keep counting, and refresh the deauth target combos only when new
+        # access points or clients arrived since the previous tick.
         self._rebuild_access_point_table()
         self._rebuild_station_table()
+        if self._targets_dirty:
+            self._refresh_targets()
+            self._targets_dirty = False
+        self._check_evil_twins()
+        self._update_locator()
+
+    def _on_security_alert(self, message: str) -> None:
+        self.status_bar.showMessage(f"⚠ {message}", 10000)
+
+    def _on_probe(self, info: dict) -> None:
+        mac = info.get("mac")
+        ssid = info.get("ssid")
+        if mac and ssid:
+            self._pnl[mac].add(ssid)
+
+    def _selected_ap_bssid(self) -> Optional[str]:
+        bssid = self._current_row_key(self.ap_table)
+        if not bssid:
+            self._show_error("Выберите точку доступа в таблице «Мониторинг»")
+        return bssid
+
+    def _on_wps_attack(self) -> None:
+        bssid = self._selected_ap_bssid()
+        if not bssid:
+            return
+        ap = self.ap_records.get(bssid, {})
+        essid = ap.get("essid") or bssid
+        if not ap.get("wps"):
+            reply = QMessageBox.question(
+                self, "WPS",
+                "У выбранной точки не обнаружен WPS. Всё равно запустить атаку?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+        reply = QMessageBox.question(
+            self, "WPS-атака",
+            f"Запустить WPS-атаку (reaver) на «{essid}»?\n"
+            "Только с разрешения владельца сети.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.wps_attack_btn.setEnabled(False)
+        self._run_async(
+            lambda: self.controller.start_wps_attack(bssid, ap.get("channel")),
+            busy="Запуск WPS-атаки…",
+            on_error=lambda: self.wps_attack_btn.setEnabled(True),
+        )
+
+    def _on_wps_stop(self) -> None:
+        self._run_async(self.controller.stop_wps_attack, busy="Остановка WPS…")
+
+    def _on_wps_state(self, running: bool) -> None:
+        self.wps_attack_btn.setEnabled(not running)
+        self.wps_stop_btn.setEnabled(running)
+
+    def _on_wps_cracked(self, result: dict) -> None:
+        parts = []
+        if result.get("pin"):
+            parts.append(f"PIN: {result['pin']}")
+        if result.get("psk"):
+            parts.append(f"PSK: {result['psk']}")
+        QMessageBox.information(self, "WPS результат", "\n".join(parts) or "Результат получен")
+
+    def _on_crack(self) -> None:
+        row = self.hs_table.currentRow()
+        if row < 0:
+            self._show_error("Выберите handshake в таблице")
+            return
+        bssid_item = self.hs_table.item(row, 0)
+        path_item = self.hs_table.item(row, 3)
+        if not bssid_item or not path_item:
+            self._show_error("Не найден BSSID или файл захвата")
+            return
+        bssid = bssid_item.text()
+        capture_path = path_item.text()
+        wordlist, _ = QFileDialog.getOpenFileName(
+            self, "Выберите словарь", "", "Словари (*.txt *.lst *.dic);;Все файлы (*)"
+        )
+        if not wordlist:
+            return
+        self.crack_btn.setEnabled(False)
+        self._run_async(
+            lambda: self.controller.start_crack(capture_path, bssid, wordlist),
+            busy="Запуск крекинга…",
+            on_error=lambda: self.crack_btn.setEnabled(True),
+        )
+
+    def _on_crack_stop(self) -> None:
+        self._run_async(self.controller.stop_crack, busy="Остановка крекинга…")
+
+    def _on_crack_state(self, running: bool) -> None:
+        self.crack_btn.setEnabled(not running)
+        self.crack_stop_btn.setEnabled(running)
+
+    def _on_crack_cracked(self, result: dict) -> None:
+        key = result.get("key", "")
+        QMessageBox.information(self, "Пароль найден", f"Пароль: {key}" if key else "Пароль найден")
+
+    def _on_request_pmkid(self) -> None:
+        bssid = self._selected_ap_bssid()
+        if not bssid:
+            return
+        essid = self.ap_records.get(bssid, {}).get("essid") or bssid
+        reply = QMessageBox.question(
+            self, "Запрос PMKID",
+            f"Отправить association request к «{essid}» для получения PMKID?\n"
+            "Требуется запущенный мониторинг. Только с разрешения владельца.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.pmkid_request_btn.setEnabled(False)
+
+        def ok(_) -> None:
+            self.pmkid_request_btn.setEnabled(True)
+            self.status_bar.showMessage("PMKID-запрос отправлен (M1 будет пойман пассивно)", 6000)
+
+        self._run_async(
+            lambda: self.controller.request_pmkid(bssid),
+            busy="Запрос PMKID…",
+            on_success=ok,
+            on_error=lambda: self.pmkid_request_btn.setEnabled(True),
+        )
+
+    def _record_rssi(self, key: str, signal) -> None:
+        if not key or signal is None:
+            return
+        try:
+            self._rssi_history[key].append((time.time(), int(signal)))
+        except (TypeError, ValueError):
+            pass
+
+    def _locator_targets(self) -> List[tuple]:
+        items: List[tuple] = []
+        for bssid, ap in sorted(self.ap_records.items()):
+            essid = ap.get("essid") or bssid
+            items.append((f"AP: {essid} ({bssid})", bssid))
+        for mac in sorted(self.station_records):
+            items.append((f"Клиент: {mac}", mac))
+        return items
+
+    def _update_locator(self) -> None:
+        targets = self._locator_targets()
+        keys = [key for _, key in targets]
+        if keys != self._locator_keys:
+            self._locator_keys = keys
+            current = self.locator_combo.currentData()
+            self.locator_combo.blockSignals(True)
+            self.locator_combo.clear()
+            for label, key in targets:
+                self.locator_combo.addItem(label, key)
+            if current:
+                idx = self.locator_combo.findData(current)
+                if idx >= 0:
+                    self.locator_combo.setCurrentIndex(idx)
+            self.locator_combo.blockSignals(False)
+
+        target = self.locator_combo.currentData()
+        history = list(self._rssi_history.get(target, [])) if target else []
+        self.rssi_plot.set_series(history)
+        if not history:
+            self.locator_value.setText("— dBm")
+            self.locator_bar.setValue(0)
+            self.locator_trend.setText("")
+            return
+        current_rssi = history[-1][1]
+        self.locator_value.setText(f"{current_rssi} dBm")
+        self.locator_bar.setValue(max(0, min(100, int((current_rssi + 90) / 60 * 100))))
+        if len(history) >= 5:
+            delta = current_rssi - history[-5][1]
+            if delta >= 2:
+                self.locator_trend.setText("↑ теплее")
+            elif delta <= -2:
+                self.locator_trend.setText("↓ холоднее")
+            else:
+                self.locator_trend.setText("→ стабильно")
+
+    def _check_evil_twins(self) -> None:
+        twins = find_evil_twins(self.ap_records.values())
+        for essid, bssids in twins.items():
+            if essid not in self._reported_twins:
+                self._reported_twins.add(essid)
+                self._append_log(
+                    f"[ВНИМАНИЕ] Возможный evil-twin: ESSID «{essid}» на {len(bssids)} BSSID"
+                )
 
     def _auto_resize_table(self, table: QTableWidget) -> None:
         if table.columnCount() == 0:
@@ -491,7 +1018,7 @@ class MainWindow(QMainWindow):
         if not last_seen:
             return False
         limit = threshold if threshold is not None else self.TARGET_STALE_SECONDS
-        return (datetime.utcnow() - last_seen) <= timedelta(seconds=limit)
+        return (utcnow() - last_seen) <= timedelta(seconds=limit)
 
     def _active_clients_for_ap(self, bssid: str) -> List[str]:
         clients = self.clients_map.get(bssid, set())
@@ -507,7 +1034,7 @@ class MainWindow(QMainWindow):
     def _format_time_since(self, last_seen: Optional[datetime]) -> str:
         if not last_seen:
             return ""
-        now = datetime.utcnow()
+        now = utcnow()
         delta = now - last_seen
         seconds = int(max(delta.total_seconds(), 0))
         if seconds < 1:
@@ -525,10 +1052,10 @@ class MainWindow(QMainWindow):
 
     def _parse_timestamp(self, value) -> Optional[datetime]:
         if isinstance(value, datetime):
-            return value
+            return as_utc(value)
         if isinstance(value, str) and value:
             try:
-                return datetime.fromisoformat(value)
+                return as_utc(datetime.fromisoformat(value))
             except ValueError:
                 return None
         return None
@@ -622,12 +1149,19 @@ class MainWindow(QMainWindow):
         self.interface_combo.blockSignals(False)
 
     def _on_refresh_interfaces(self) -> None:
-        try:
-            interfaces = self.controller.refresh_interfaces()
+        self.refresh_interfaces_btn.setEnabled(False)
+
+        def ok(interfaces) -> None:
+            self.refresh_interfaces_btn.setEnabled(True)
             if not interfaces:
                 self.status_bar.showMessage("Беспроводные интерфейсы не найдены", 5000)
-        except Exception as exc:
-            self._show_error(str(exc))
+
+        self._run_async(
+            self.controller.refresh_interfaces,
+            busy="Обновление списка интерфейсов…",
+            on_success=ok,
+            on_error=lambda: self.refresh_interfaces_btn.setEnabled(True),
+        )
 
     def _on_start_deauth(self) -> None:
         bssid = self.target_ap_combo.currentData()
@@ -643,6 +1177,19 @@ class MainWindow(QMainWindow):
         if not clients:
             self._show_error("Активные клиенты не найдены")
             return
+        essid = self.ap_records.get(bssid, {}).get("essid") or bssid
+        target = clients[0] if len(clients) == 1 else f"всех активных клиентов ({len(clients)})"
+        reply = QMessageBox.question(
+            self,
+            "Подтверждение деаутентификации",
+            f"Отправить deauth-кадры для {target} на сети «{essid}»?\n\n"
+            "Убедитесь, что у вас есть разрешение на тестирование этой сети.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self._save_settings()
         try:
             self.controller.start_deauth(
                 bssid,
@@ -654,14 +1201,92 @@ class MainWindow(QMainWindow):
             self._show_error(str(exc))
 
     def _on_stop_deauth(self) -> None:
+        self._auto_capture_bssid = None
+        self._auto_capture_timer.stop()
         try:
             self.controller.stop_deauth()
         except Exception as exc:
             self._show_error(str(exc))
 
+    def _on_auto_capture(self) -> None:
+        bssid = self.target_ap_combo.currentData()
+        if not bssid:
+            self._show_error("Выберите точку доступа с активными клиентами")
+            return
+        client_value = self.target_client_combo.currentData()
+        clients = [client_value] if client_value else sorted(self._active_clients_for_ap(bssid))
+        if not clients:
+            self._show_error("Активные клиенты не найдены")
+            return
+        essid = self.ap_records.get(bssid, {}).get("essid") or bssid
+        reply = QMessageBox.question(
+            self,
+            "Авто-захват",
+            f"Запустить авто-захват для сети «{essid}»?\n\n"
+            "Будет выполнена деаутентификация клиентов для получения handshake/PMKID, "
+            "после чего первый захват автоматически экспортируется в hashcat 22000.\n"
+            "Убедитесь, что у вас есть разрешение на тестирование этой сети.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self._save_settings()
+        try:
+            self.controller.start_deauth(
+                bssid,
+                clients,
+                self.deauth_count_spin.value(),
+                self.deauth_interval_spin.value(),
+            )
+        except Exception as exc:
+            self._show_error(str(exc))
+            return
+        self._auto_capture_bssid = bssid
+        self._auto_capture_timer.start(self.AUTO_CAPTURE_TIMEOUT_MS)
+        self.status_bar.showMessage(f"Авто-захват запущен для {essid}", 5000)
+
+    def _finish_auto_capture(self, handshake: dict) -> None:
+        self._auto_capture_timer.stop()
+        bssid = self._auto_capture_bssid
+        self._auto_capture_bssid = None
+        try:
+            self.controller.stop_deauth()
+        except Exception:  # noqa: BLE001 - already stopping, ignore
+            pass
+        kind = handshake.get("kind") or "handshake"
+        capture_path = handshake.get("capture_path")
+        if not capture_path or not self.capture_dir:
+            self.status_bar.showMessage(f"Авто-захват: получен {kind}", 8000)
+            return
+        out = Path(self.capture_dir) / f"{str(bssid or '').replace(':', '')}_{kind}.hc22000"
+
+        def ok(_) -> None:
+            self.status_bar.showMessage(f"Авто-захват: {kind} → {out.name}", 8000)
+
+        self._run_async(
+            lambda: self.controller.export_hashcat(Path(capture_path), out),
+            busy=f"Авто-захват: экспорт {kind}…",
+            on_success=ok,
+            on_error=lambda: self.status_bar.showMessage(
+                f"Авто-захват: {kind} получен, экспорт не удался", 8000
+            ),
+        )
+
+    def _on_auto_capture_timeout(self) -> None:
+        if not self._auto_capture_bssid:
+            return
+        self._auto_capture_bssid = None
+        try:
+            self.controller.stop_deauth()
+        except Exception:  # noqa: BLE001
+            pass
+        self.status_bar.showMessage("Авто-захват: handshake не пойман, остановлено", 8000)
+
     def _on_deauth_state(self, running: bool) -> None:
         self.start_deauth_btn.setEnabled(not running)
         self.stop_deauth_btn.setEnabled(running)
+        self.auto_capture_btn.setEnabled(not running)
 
     def _find_row(self, table: QTableWidget, key: str) -> Optional[int]:
         for row in range(table.rowCount()):
@@ -673,8 +1298,25 @@ class MainWindow(QMainWindow):
     def _show_error(self, message: str) -> None:
         QMessageBox.critical(self, "Ошибка", message)
 
+    def _restore_settings(self) -> None:
+        iface = self._settings.value("interface", "", type=str)
+        if iface:
+            self.interface_combo.setEditText(iface)
+        self.deauth_count_spin.setValue(
+            self._settings.value("deauth/count", self.deauth_count_spin.value(), type=int)
+        )
+        self.deauth_interval_spin.setValue(
+            self._settings.value("deauth/interval", self.deauth_interval_spin.value(), type=float)
+        )
+
+    def _save_settings(self) -> None:
+        self._settings.setValue("interface", self.interface_combo.currentText().strip())
+        self._settings.setValue("deauth/count", self.deauth_count_spin.value())
+        self._settings.setValue("deauth/interval", self.deauth_interval_spin.value())
+
     def closeEvent(self, event) -> None:  # type: ignore
         try:
+            self._save_settings()
             self.controller.stop_capture()
         finally:
             super().closeEvent(event)

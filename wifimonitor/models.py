@@ -2,6 +2,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
+from .timeutil import utcnow
+
 
 @dataclass
 class AccessPoint:
@@ -10,7 +12,9 @@ class AccessPoint:
     channel: Optional[int] = None
     encryption: Optional[str] = None
     signal: Optional[int] = None
-    last_seen: datetime = field(default_factory=datetime.utcnow)
+    wps: bool = False
+    mfp_required: bool = False
+    last_seen: datetime = field(default_factory=utcnow)
 
 
 @dataclass
@@ -18,7 +22,7 @@ class Station:
     mac: str
     associated_bssid: Optional[str] = None
     signal: Optional[int] = None
-    last_seen: datetime = field(default_factory=datetime.utcnow)
+    last_seen: datetime = field(default_factory=utcnow)
 
 
 @dataclass
@@ -26,4 +30,6 @@ class Handshake:
     bssid: str
     station_mac: str
     capture_path: str
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    kind: str = "handshake"  # "handshake" (4-way EAPOL) or "pmkid"
+    quality: str = ""  # crackable / partial / ...
+    created_at: datetime = field(default_factory=utcnow)

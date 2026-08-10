@@ -2,14 +2,30 @@ import subprocess
 import threading
 import time
 from collections import defaultdict
-from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
-from scapy.all import Dot11, Dot11Beacon, Dot11Elt, Dot11ProbeResp, EAPOL, sniff, wrpcap  # type: ignore
+from scapy.all import (  # type: ignore
+    Dot11,
+    Dot11AssoReq,
+    Dot11Beacon,
+    Dot11Deauth,
+    Dot11Disas,
+    Dot11Elt,
+    Dot11ProbeReq,
+    Dot11ProbeResp,
+    Dot11ReassoReq,
+    EAPOL,
+    sniff,
+    wrpcap,
+)
 from scapy.packet import Packet  # type: ignore
 
+from .detect import DeauthFloodDetector
+from .hashcat import capture_quality, find_pmkid, parse_key_frame
 from .models import AccessPoint, Handshake, Station
+from .timeutil import utcnow
+from .wifi_ie import WPA_VENDOR_HEADER, WPS_VENDOR_HEADER, frequency_to_channel, parse_rsn
 
 DEFAULT_CHANNELS_24GHZ = list(range(1, 14))
 DEFAULT_CHANNELS_5GHZ = [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165]
@@ -95,12 +111,19 @@ class MonitorService:
         channel_hop_interval: float = 0.5,
         enable_channel_hopper: bool = True,
         on_log: Optional[Callable[[str], None]] = None,
+        on_alert: Optional[Callable[[str], None]] = None,
+        on_probe: Optional[Callable[[str, str], None]] = None,
+        on_ssid_reveal: Optional[Callable[[str, str], None]] = None,
     ) -> None:
         self.interface = interface
         self.capture_dir = capture_dir
         self.on_access_point = on_access_point
         self.on_station = on_station
         self.on_handshake = on_handshake
+        self.on_alert = on_alert
+        self.on_probe = on_probe
+        self.on_ssid_reveal = on_ssid_reveal
+        self._deauth_detector = DeauthFloodDetector()
         self._thread: Optional[threading.Thread] = None
         self._running = threading.Event()
         self.capture_dir.mkdir(parents=True, exist_ok=True)
@@ -112,6 +135,7 @@ class MonitorService:
         self._log = on_log
         self._seen_access_points: Set[str] = set()
         self._seen_stations: Set[str] = set()
+        self._seen_pmkids: Set[Tuple[str, str]] = set()
         self._locked_channel: Optional[int] = None
         self._last_beacon: Dict[str, Packet] = {}
 
@@ -144,7 +168,12 @@ class MonitorService:
             self._log("Пассивное сканирование остановлено")
 
     def _sniff_loop(self) -> None:
-        sniff(iface=self.interface, prn=self._handle_packet, store=False, stop_filter=self._should_stop)
+        try:
+            sniff(iface=self.interface, prn=self._handle_packet, store=False, stop_filter=self._should_stop)
+        except Exception as exc:  # noqa: BLE001 - surface capture errors instead of dying silently
+            self._running.clear()
+            if self._log:
+                self._log(f"Ошибка захвата на {self.interface}: {exc}")
 
     def _should_stop(self, _) -> bool:
         return not self._running.is_set()
@@ -169,7 +198,7 @@ class MonitorService:
                         self._last_beacon[bssid] = packet
         elif dot11.type == 2:
             station_mac = dot11.addr2
-            station = Station(mac=station_mac, associated_bssid=bssid, last_seen=datetime.utcnow())
+            station = Station(mac=station_mac, associated_bssid=bssid, last_seen=utcnow())
             signal = getattr(packet, "dBm_AntSignal", None)
             if signal is not None:
                 station.signal = int(signal)
@@ -181,13 +210,54 @@ class MonitorService:
                     self._log(f"Обнаружен клиент {station.mac} (BSSID {label})")
         if packet.haslayer(EAPOL):
             self._process_handshake(packet, bssid)
+        if packet.haslayer(Dot11Deauth) or packet.haslayer(Dot11Disas):
+            alert = self._deauth_detector.add(time.time())
+            if alert and self.on_alert:
+                self.on_alert(alert)
+        if packet.haslayer(Dot11ProbeReq):
+            self._handle_probe_request(packet)
+        elif packet.haslayer(Dot11AssoReq) or packet.haslayer(Dot11ReassoReq):
+            ssid = self._extract_ssid(packet)
+            if ssid and bssid and self.on_ssid_reveal:
+                self.on_ssid_reveal(bssid, ssid)
+
+    def _extract_ssid(self, packet) -> Optional[str]:
+        elt = packet.getlayer(Dot11Elt)
+        while elt is not None:
+            if elt.ID == 0:
+                try:
+                    return elt.info.decode(errors="ignore") or None
+                except Exception:  # noqa: BLE001
+                    return None
+            elt = elt.payload.getlayer(Dot11Elt)
+        return None
+
+    def _handle_probe_request(self, packet) -> None:
+        dot11 = packet[Dot11]
+        client = dot11.addr2
+        if not client:
+            return
+        # A probe-only client isn't associated to any BSSID yet, but is still
+        # worth surfacing (and useful for the locator).
+        station = Station(mac=client, associated_bssid=None, last_seen=utcnow())
+        signal = getattr(packet, "dBm_AntSignal", None)
+        if signal is not None:
+            station.signal = int(signal)
+        if self.on_station:
+            self.on_station(station)
+        ssid = self._extract_ssid(packet)
+        if ssid and self.on_probe:
+            self.on_probe(client, ssid)
 
     def _parse_access_point(self, packet, bssid: Optional[str]) -> Optional[AccessPoint]:
         if not bssid:
             return None
         essid = None
         channel = None
+        ht_channel = None
         encryption = []
+        wps = False
+        mfp_required = False
         signal = getattr(packet, "dBm_AntSignal", None)
         elt = packet.getlayer(Dot11Elt)
         while elt is not None:
@@ -195,18 +265,38 @@ class MonitorService:
                 essid = elt.info.decode(errors="ignore") or None
             elif elt.ID == 3 and elt.info:
                 channel = elt.info[0]
+            elif elt.ID == 61 and elt.info:
+                ht_channel = elt.info[0]  # HT Operation: primary channel (5 GHz)
             elif elt.ID == 48:
-                encryption.append("WPA2")
+                rsn = parse_rsn(bytes(elt.info))
+                encryption.append(str(rsn["classification"]))
+                mfp_required = mfp_required or bool(rsn["mfp_required"])
             elif elt.ID == 221:
-                if b"RSN" in elt.info:
-                    encryption.append("WPA3")
+                header = bytes(elt.info)[:4]
+                if header == WPA_VENDOR_HEADER:
+                    encryption.append("WPA")
+                elif header == WPS_VENDOR_HEADER:
+                    wps = True
             elt = elt.payload.getlayer(Dot11Elt)
+        # DS Parameter Set (IE 3) is usually absent on 5/6 GHz; fall back to the
+        # HT Operation primary channel and finally the RadioTap frequency.
+        if not channel:
+            channel = ht_channel
+        if not channel:
+            channel = frequency_to_channel(getattr(packet, "ChannelFrequency", None))
+        ordered: List[str] = []
+        for token in encryption:
+            for part in token.split("/"):
+                if part not in ordered:
+                    ordered.append(part)
         ap = AccessPoint(
             bssid=bssid,
             essid=essid,
             channel=channel,
-            encryption="/".join(encryption) if encryption else None,
-            last_seen=datetime.utcnow(),
+            encryption="/".join(ordered) if ordered else None,
+            wps=wps,
+            mfp_required=mfp_required,
+            last_seen=utcnow(),
         )
         if signal is not None:
             ap.signal = int(signal)
@@ -226,6 +316,7 @@ class MonitorService:
             station_mac = transmitter
         if not station_mac:
             return
+        self._maybe_capture_pmkid(packet, bssid, station_mac)
         key = (bssid, station_mac)
         buffer = self._handshake_buffers[key]
         buffer.append(packet)
@@ -240,8 +331,15 @@ class MonitorService:
                     f"Получен EAPOL кадр #{len(buffer)} {arrow} {msg_label} ack={'Y' if info[1] else 'N'} mic={'Y' if info[3] else 'N'} secure={'Y' if info[4] else 'N'}"
                 )
         if self._is_complete_handshake(buffer):
+            ap_msgs, sta_msgs = self._message_sets(buffer)
+            quality = capture_quality(ap_msgs | sta_msgs)
             capture_path = self._write_handshake(key, buffer)
-            handshake = Handshake(bssid=bssid, station_mac=station_mac, capture_path=str(capture_path))
+            handshake = Handshake(
+                bssid=bssid,
+                station_mac=station_mac,
+                capture_path=str(capture_path),
+                quality=quality,
+            )
             if self.on_handshake:
                 self.on_handshake(handshake)
             if self._log:
@@ -249,6 +347,34 @@ class MonitorService:
                     f"Сохранён handshake для {bssid} ⇄ {station_mac}: {capture_path.name}"
                 )
             self._handshake_buffers.pop(key, None)
+
+    def _maybe_capture_pmkid(self, packet, bssid: str, station_mac: str) -> None:
+        key = (bssid, station_mac)
+        if key in self._seen_pmkids:
+            return
+        try:
+            raw = bytes(packet.getlayer(EAPOL))
+        except Exception:  # noqa: BLE001 - malformed frame, nothing to extract
+            return
+        frame = parse_key_frame(raw)
+        if frame is None or frame.message != 1:
+            return
+        pmkid = find_pmkid(frame.key_data)
+        if not pmkid:
+            return
+        self._seen_pmkids.add(key)
+        capture_path = self._write_handshake(key, [packet], label="pmkid")
+        handshake = Handshake(
+            bssid=bssid,
+            station_mac=station_mac,
+            capture_path=str(capture_path),
+            kind="pmkid",
+            quality="crackable (PMKID)",
+        )
+        if self.on_handshake:
+            self.on_handshake(handshake)
+        if self._log:
+            self._log(f"Получен PMKID для {bssid} ⇄ {station_mac}: {capture_path.name}")
 
     def lock_channel(self, channel: int) -> bool:
         if channel <= 0:
@@ -283,7 +409,7 @@ class MonitorService:
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    def _is_complete_handshake(self, packets: List[Packet]) -> bool:
+    def _message_sets(self, packets: List[Packet]) -> Tuple[Set[int], Set[int]]:
         ap_msgs: Set[int] = set()
         sta_msgs: Set[int] = set()
         for pkt in packets:
@@ -301,11 +427,13 @@ class MonitorService:
                 ap_msgs.add(msg)
             else:
                 sta_msgs.add(msg)
-        if 3 in ap_msgs and 2 in sta_msgs:
-            return True
-        if 3 in ap_msgs and 4 in sta_msgs:
-            return True
-        return False
+        return ap_msgs, sta_msgs
+
+    def _is_complete_handshake(self, packets: List[Packet]) -> bool:
+        ap_msgs, sta_msgs = self._message_sets(packets)
+        # A crackable capture needs M2 (SNONCE+MIC from the station) plus an
+        # ANONCE source (M1 or M3 from the AP). M3+M4 alone is not exportable.
+        return 2 in sta_msgs and (1 in ap_msgs or 3 in ap_msgs)
 
     def _parse_eapol_key_info(self, eapol: Packet) -> Optional[Tuple[int, bool, bool, bool, bool, int]]:
         raw = bytes(eapol)
@@ -326,9 +454,9 @@ class MonitorService:
             msg = 0
         return key_info, ack, install, mic, secure, msg
 
-    def _write_handshake(self, key: Tuple[str, str], packets: List[Packet]) -> Path:
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        filename = f"handshake_{key[0].replace(':', '')}_{key[1].replace(':', '')}_{timestamp}.pcap"
+    def _write_handshake(self, key: Tuple[str, str], packets: List[Packet], label: str = "handshake") -> Path:
+        timestamp = utcnow().strftime("%Y%m%d_%H%M%S")
+        filename = f"{label}_{key[0].replace(':', '')}_{key[1].replace(':', '')}_{timestamp}.pcap"
         path = self.capture_dir / filename
         to_dump: List[Packet] = []
         beacon = self._last_beacon.get(key[0])

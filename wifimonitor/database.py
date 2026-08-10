@@ -31,10 +31,17 @@ class DatabaseManager:
                     channel INTEGER,
                     encryption TEXT,
                     signal INTEGER,
+                    wps INTEGER DEFAULT 0,
+                    mfp_required INTEGER DEFAULT 0,
                     last_seen TEXT
                 )
                 """
             )
+            ap_columns = {row[1] for row in conn.execute("PRAGMA table_info(access_points)")}
+            if "wps" not in ap_columns:
+                conn.execute("ALTER TABLE access_points ADD COLUMN wps INTEGER DEFAULT 0")
+            if "mfp_required" not in ap_columns:
+                conn.execute("ALTER TABLE access_points ADD COLUMN mfp_required INTEGER DEFAULT 0")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS stations (
@@ -52,22 +59,32 @@ class DatabaseManager:
                     bssid TEXT,
                     station_mac TEXT,
                     capture_path TEXT,
+                    kind TEXT DEFAULT 'handshake',
+                    quality TEXT DEFAULT '',
                     created_at TEXT
                 )
                 """
             )
+            # Migrate databases created before the kind/quality columns existed.
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(handshakes)")}
+            if "kind" not in columns:
+                conn.execute("ALTER TABLE handshakes ADD COLUMN kind TEXT DEFAULT 'handshake'")
+            if "quality" not in columns:
+                conn.execute("ALTER TABLE handshakes ADD COLUMN quality TEXT DEFAULT ''")
 
     def upsert_access_point(self, ap: AccessPoint) -> None:
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO access_points (bssid, essid, channel, encryption, signal, last_seen)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO access_points (bssid, essid, channel, encryption, signal, wps, mfp_required, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(bssid) DO UPDATE SET
                     essid=excluded.essid,
                     channel=excluded.channel,
                     encryption=excluded.encryption,
                     signal=excluded.signal,
+                    wps=excluded.wps,
+                    mfp_required=excluded.mfp_required,
                     last_seen=excluded.last_seen
                 """,
                 (
@@ -76,6 +93,8 @@ class DatabaseManager:
                     ap.channel,
                     ap.encryption,
                     ap.signal,
+                    int(ap.wps),
+                    int(ap.mfp_required),
                     ap.last_seen.isoformat(),
                 ),
             )
@@ -103,13 +122,15 @@ class DatabaseManager:
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO handshakes (bssid, station_mac, capture_path, created_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO handshakes (bssid, station_mac, capture_path, kind, quality, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     handshake.bssid,
                     handshake.station_mac,
                     handshake.capture_path,
+                    handshake.kind,
+                    handshake.quality,
                     handshake.created_at.isoformat(),
                 ),
             )

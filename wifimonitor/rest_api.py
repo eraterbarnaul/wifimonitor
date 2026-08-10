@@ -7,12 +7,15 @@ dependency. For production use, consider wrapping with a proper ASGI framework.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
+from .auth import check_token
+from .plugins import registry
 from .usecases import MonitorUseCase
 
 
@@ -20,9 +23,17 @@ class ApiHandler(BaseHTTPRequestHandler):
     """HTTP request handler for the REST API."""
 
     use_case: Optional[MonitorUseCase] = None
+    auth_token: str = ""  # when set, requests must present it
 
     def log_message(self, format, *args):
         pass  # Suppress default logging
+
+    def _authorized(self) -> bool:
+        query_token = (parse_qs(urlparse(self.path).query).get("token") or [""])[0]
+        if check_token(self.auth_token, self.headers.get("Authorization", ""), query_token):
+            return True
+        self._error(401, "Unauthorized")
+        return False
 
     def _json_response(self, data: Any, status: int = 200) -> None:
         body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
@@ -60,9 +71,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         if not uc:
             self._error(503, "Not initialized")
             return
+        if not self._authorized():
+            return
 
         path = urlparse(self.path).path.rstrip("/")
 
+        if path == "/api/plugins":
+            self._json_response(registry.list_plugins())
+            return
         if path == "/api/status":
             self._json_response({
                 "interface": uc.current_interface,
@@ -109,6 +125,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         if not uc:
             self._error(503, "Not initialized")
             return
+        if not self._authorized():
+            return
 
         path = urlparse(self.path).path.rstrip("/")
 
@@ -154,15 +172,28 @@ class ApiHandler(BaseHTTPRequestHandler):
 class RestApiServer:
     """Lightweight REST API server for remote monitoring."""
 
-    def __init__(self, use_case: MonitorUseCase, host: str = "0.0.0.0", port: int = 8080) -> None:
+    def __init__(
+        self,
+        use_case: MonitorUseCase,
+        host: str = "127.0.0.1",
+        port: int = 8080,
+        token: str = "",
+    ) -> None:
         self._uc = use_case
         self._host = host
         self._port = port
+        self._token = token
         self._server: Optional[HTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
         ApiHandler.use_case = self._uc
+        ApiHandler.auth_token = self._token
+        if self._host not in ("127.0.0.1", "localhost", "::1") and not self._token:
+            logging.getLogger("wifimonitor").warning(
+                "REST API слушает %s без токена — доступ к управлению и данным открыт всем в сети",
+                self._host,
+            )
         self._server = HTTPServer((self._host, self._port), ApiHandler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()

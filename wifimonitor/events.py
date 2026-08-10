@@ -7,9 +7,12 @@ bridges events to pyqtSignals for the UI.
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections import defaultdict
 from typing import Any, Callable, Dict, List
+
+log = logging.getLogger("wifimonitor.events")
 
 
 class EventBus:
@@ -36,8 +39,8 @@ class EventBus:
         for cb in callbacks:
             try:
                 cb(*args, **kwargs)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception:  # noqa: BLE001 - a bad subscriber must not break the bus
+                log.exception("event subscriber for %r raised", event)
 
     def clear(self) -> None:
         with self._lock:

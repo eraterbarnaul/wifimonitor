@@ -202,6 +202,13 @@ class MonitorUseCase:
         stations = [dict(row) for row in self.db.fetch_stations()]
         return self.csv_exporter.export(output_path, access_points, stations)
 
+    def export_wigle(self, output_path: Path) -> Path:
+        """Export GPS-tagged access points to WiGLE CSV for wardriving upload."""
+        from .wardriving import export_wigle
+        locations = [dict(row) for row in self.db.fetch_ap_locations()]
+        ap_index = {row["bssid"]: dict(row) for row in self.db.fetch_access_points()}
+        return export_wigle(output_path, locations, ap_index)
+
     def export_report(self, output_path: Path) -> None:
         from .detect import find_evil_twins
         from .report import build_html_report

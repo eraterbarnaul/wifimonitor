@@ -11,6 +11,8 @@ class InterfaceManager:
         self.base_interface: Optional[str] = None
         self.monitor_interface = monitor_interface
         self._auto_started = False
+        # How monitor mode was enabled ("airmon" or "iw"), so we can undo it symmetrically.
+        self._monitor_method: Optional[str] = None
         self._timeout = timeout
         # Dual-interface support
         self.secondary_interface: Optional[str] = None
@@ -20,6 +22,7 @@ class InterfaceManager:
         self.base_interface = interface
         self.monitor_interface = interface
         self._auto_started = False
+        self._monitor_method = None
 
     def set_secondary_interface(self, interface: str) -> None:
         """Set a secondary interface for injection (dual-adapter mode)."""
@@ -68,12 +71,20 @@ class InterfaceManager:
             raise ValueError("Мониторный интерфейс не задан")
         if not self._auto_started:
             return
-        output = self._run_command(["airmon-ng", "stop", self.monitor_interface], check=False)
-        if output.returncode != 0:
-            message = output.stderr.strip() or output.stdout.strip() or "Не удалось остановить мониторный режим"
-            raise RuntimeError(message)
+        if self._monitor_method == "iw":
+            # We switched the device in place; restore it to managed mode.
+            iface = self.monitor_interface
+            self._run_command(["ip", "link", "set", iface, "down"], check=False)
+            self._run_command(["iw", "dev", iface, "set", "type", "managed"], check=False)
+            self._run_command(["ip", "link", "set", iface, "up"], check=False)
+        else:
+            output = self._run_command(["airmon-ng", "stop", self.monitor_interface], check=False)
+            if output.returncode != 0:
+                message = output.stderr.strip() or output.stdout.strip() or "Не удалось остановить мониторный режим"
+                raise RuntimeError(message)
         self.monitor_interface = self.base_interface
         self._auto_started = False
+        self._monitor_method = None
 
     def disable_secondary_monitor(self) -> None:
         """Stop monitor mode on the secondary interface."""
@@ -110,6 +121,11 @@ class InterfaceManager:
     def _start_monitor_mode(self, interface: str) -> str:
         try:
             result = self._run_command(["airmon-ng", "start", interface])
+        except FileNotFoundError:
+            # airmon-ng isn't installed — switch the device to monitor mode in
+            # place with iw/ip (works on mac80211 drivers without aircrack-ng).
+            self._monitor_method = "iw"
+            return self._start_monitor_mode_iw(interface)
         except RuntimeError as exc:
             message = str(exc)
             if "process" in message.lower():
@@ -117,7 +133,20 @@ class InterfaceManager:
                 result = self._run_command(["airmon-ng", "start", interface])
             else:
                 raise
+        self._monitor_method = "airmon"
         return (result.stdout or "") + (result.stderr or "")
+
+    def _start_monitor_mode_iw(self, interface: str) -> str:
+        """Enable monitor mode in place with iw/ip when airmon-ng is missing.
+
+        Brings the interface down, switches its type to monitor and brings it
+        back up. The device keeps its name, so we return a marker line that
+        ``_parse_monitor_interface`` resolves back to that same name.
+        """
+        self._run_command(["ip", "link", "set", interface, "down"])
+        self._run_command(["iw", "dev", interface, "set", "type", "monitor"])
+        self._run_command(["ip", "link", "set", interface, "up"])
+        return f"monitor mode enabled on {interface}"
 
     def _is_monitor_mode(self, interface: str) -> bool:
         try:

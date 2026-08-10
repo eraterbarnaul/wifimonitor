@@ -11,6 +11,7 @@ Example::
 from __future__ import annotations
 
 import argparse
+import os
 import threading
 import time
 from typing import List, Optional
@@ -33,6 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="stop after N captures (0 = no limit)",
     )
     parser.add_argument("--report", default="", help="write an HTML report here on exit")
+    parser.add_argument("--wigle", default="", help="write a WiGLE CSV of GPS-tagged APs on exit")
     parser.add_argument(
         "--no-monitor-setup", action="store_true",
         help="interface is already in monitor mode (skip airmon-ng)",
@@ -50,6 +52,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="REST API bind host (default: 127.0.0.1; use 0.0.0.0 to expose — no auth!)",
     )
     parser.add_argument("--api-port", type=int, default=8080, help="REST API port (default: 8080)")
+    parser.add_argument(
+        "--api-token", default=os.environ.get("WIFIMONITOR_API_TOKEN", ""),
+        help="require this bearer token for the REST API (env: WIFIMONITOR_API_TOKEN)",
+    )
     return parser
 
 
@@ -95,9 +101,13 @@ def run(args: argparse.Namespace) -> int:
     if args.api:
         from .rest_api import RestApiServer
 
-        server = RestApiServer(uc, host=args.api_host, port=args.api_port)
+        server = RestApiServer(uc, host=args.api_host, port=args.api_port, token=args.api_token)
         server.start()
-        log.info("REST API on %s (web UI at /) — control capture via the API", server.url)
+        log.info(
+            "REST API on %s (web UI at /) — control capture via the API%s",
+            server.url,
+            "" if args.api_token else " [no token: keep it on localhost]",
+        )
     else:
         log.info("headless capture on %s", args.interface)
         uc.start_capture()
@@ -119,6 +129,9 @@ def run(args: argparse.Namespace) -> int:
     if args.report:
         uc.export_report(Path(args.report))
         log.info("report written to %s", args.report)
+    if args.wigle:
+        uc.export_wigle(Path(args.wigle))
+        log.info("WiGLE CSV written to %s", args.wigle)
     return 0
 
 

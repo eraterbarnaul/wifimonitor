@@ -7,10 +7,13 @@ unit tested. For authorised testing only.
 
 from __future__ import annotations
 
+import logging
 import re
 import subprocess
 import threading
 from typing import Callable, List, Optional
+
+log = logging.getLogger("wifimonitor.crack")
 
 _KEY_FOUND_RE = re.compile(r"KEY FOUND!\s*\[\s*(.+?)\s*\]")
 _PROGRESS_RE = re.compile(r"([\d,]+)\s*/\s*([\d,]+)\s+keys tested", re.IGNORECASE)
@@ -100,8 +103,8 @@ class CrackService:
         if self._proc and self._proc.poll() is None:
             try:
                 self._proc.terminate()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception:  # noqa: BLE001 - process may already be gone
+                log.debug("terminating hashcat failed", exc_info=True)
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2)
         self._proc = None

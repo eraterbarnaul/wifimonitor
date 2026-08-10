@@ -1,9 +1,6 @@
 """Tests for multi-session comparison."""
-import time
-from pathlib import Path
 
 from wifimonitor.database import DatabaseManager
-from wifimonitor.models import AccessPoint
 
 
 def test_create_and_compare_sessions(tmp_path):

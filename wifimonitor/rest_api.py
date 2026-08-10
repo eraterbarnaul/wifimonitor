@@ -11,9 +11,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
-from .events import EventBus, Events
 from .usecases import MonitorUseCase
 
 

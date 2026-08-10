@@ -1,5 +1,4 @@
 """Tests for CSV injection protection."""
-from pathlib import Path
 from wifimonitor.csv_export import _sanitize_cell, CsvExporter
 
 

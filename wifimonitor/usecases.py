@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
-from .auto_attack import AutoAttackPipeline, AutoAttackPhase
+from .auto_attack import AutoAttackPipeline
 from .capture import MonitorService
 from .crack import CrackService
 from .csv_export import CsvExporter

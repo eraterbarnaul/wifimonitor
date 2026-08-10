@@ -1,10 +1,8 @@
 """Tests for the REST API server."""
 import json
-import threading
 import time
 import urllib.request
-from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
 
@@ -85,7 +83,7 @@ def test_sessions_empty(api_server):
 def test_web_ui_served(api_server):
     """The root path should serve the HTML web UI."""
     server, uc = api_server
-    url = f"http://127.0.0.1:18932/"
+    url = "http://127.0.0.1:18932/"
     with urllib.request.urlopen(url, timeout=5) as resp:
         html = resp.read().decode()
         assert "Wifimonitor" in html

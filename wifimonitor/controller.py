@@ -6,18 +6,12 @@ simply subscribes to events and re-emits them as Qt signals for the UI.
 
 from __future__ import annotations
 
-import logging
-import threading
-from collections import defaultdict
-from dataclasses import asdict
-from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import List, Optional
 
 from PyQt5.QtCore import QObject, pyqtSignal
 
 from .events import EventBus, Events
-from .models import AccessPoint, Handshake, Station
 from .usecases import MonitorUseCase
 
 

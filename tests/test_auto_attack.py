@@ -1,7 +1,6 @@
 """Tests for the auto-attack pipeline."""
 import time
 from unittest.mock import patch, MagicMock
-from pathlib import Path
 
 from wifimonitor.auto_attack import AutoAttackPipeline, AutoAttackPhase
 

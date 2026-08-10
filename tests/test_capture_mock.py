@@ -1,9 +1,6 @@
 """Unit tests for capture module with mocked scapy."""
-import threading
 import time
-from pathlib import Path
-from unittest.mock import MagicMock, patch, PropertyMock
-from collections import defaultdict
+from unittest.mock import MagicMock, patch
 
 import pytest
 

@@ -1,5 +1,4 @@
 """Tests for extended OUI module."""
-from pathlib import Path
 from wifimonitor.oui import lookup_vendor, is_randomized_mac, load_oui_file, load_nmap_prefixes, table_size
 
 

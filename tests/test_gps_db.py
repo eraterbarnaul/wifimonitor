@@ -1,5 +1,4 @@
 """Tests for GPS database integration."""
-from pathlib import Path
 from wifimonitor.database import DatabaseManager
 
 

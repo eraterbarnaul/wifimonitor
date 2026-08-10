@@ -9,7 +9,7 @@ and EHT (802.11be) indicators for Wi-Fi generation and bandwidth detection.
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 RSN_AKM_OUI = b"\x00\x0f\xac"
 RSN_SAE_SUITES = {RSN_AKM_OUI + b"\x08", RSN_AKM_OUI + b"\x09"}  # SAE / FT-SAE => WPA3

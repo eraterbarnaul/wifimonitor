@@ -1,6 +1,6 @@
 """Unit tests for WifiMonitorController with mocks."""
 from pathlib import Path
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import patch
 
 import pytest
 
@@ -13,7 +13,7 @@ def controller(tmp_path):
         mock_bus = MockBus.return_value
         mock_uc = MockUC.return_value
         mock_uc.bus = mock_bus
-        
+
         # Need to import after patches
         from wifimonitor.controller import WifiMonitorController
         ctrl = WifiMonitorController(db_path=tmp_path / "test.db", capture_dir=tmp_path / "caps")

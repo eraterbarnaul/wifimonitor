@@ -1,9 +1,6 @@
 """Full coverage tests for wifimonitor.database module."""
 
-import sqlite3
 import threading
-import time
-from pathlib import Path
 
 import pytest
 

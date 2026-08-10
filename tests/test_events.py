@@ -24,7 +24,10 @@ def test_multiple_subscribers():
 def test_unsubscribe():
     bus = EventBus()
     received = []
-    cb = lambda x: received.append(x)
+
+    def cb(x):
+        received.append(x)
+
     bus.subscribe("ev", cb)
     bus.unsubscribe("ev", cb)
     bus.emit("ev", "nope")

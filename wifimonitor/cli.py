@@ -81,7 +81,7 @@ def run(args: argparse.Namespace) -> int:
     if args.no_monitor_setup:
         uc.interface_manager.monitor_interface = args.interface
         uc.interface_manager._auto_started = False
-    
+
     log.info("headless capture on %s", args.interface)
     uc.start_capture()
 

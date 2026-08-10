@@ -377,6 +377,8 @@ class MonitorService:
             elif elt.ID == IE_VHT_CAPABILITIES and elt.info:
                 vht_caps = parse_vht_capabilities(bytes(elt.info))
                 has_vht = True
+                if not vht_bandwidth:
+                    vht_bandwidth = str(vht_caps.get("max_bandwidth", ""))
             elif elt.ID == IE_VHT_OPERATION and elt.info:
                 vht_op = parse_vht_operation(bytes(elt.info))
                 has_vht = True

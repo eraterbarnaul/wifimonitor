@@ -5,7 +5,6 @@ from wifimonitor.plugins import (
     WpsAttackPlugin,
     PmkidRequestPlugin,
     CrackPlugin,
-    AttackContext,
 )
 
 

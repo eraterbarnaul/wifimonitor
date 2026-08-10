@@ -15,7 +15,13 @@ class InterfaceManager:
         self._auto_started = False
 
     def ensure_monitor_mode(self, interface: Optional[str] = None) -> str:
-        if interface:
+        # If a monitor interface is already up, reuse it. airmon-ng typically
+        # renames the device (wlan0 -> wlan0mon), so a second call — e.g. Start
+        # right after Enable — must not try to re-enable the now-missing base
+        # interface. This makes the flow work without re-selecting/re-applying.
+        if self.monitor_interface and self._is_monitor_mode(self.monitor_interface):
+            return self.monitor_interface
+        if interface and interface != self.base_interface:
             self.set_base_interface(interface)
         if not self.base_interface:
             raise ValueError("Не указан интерфейс для активации мониторного режима")

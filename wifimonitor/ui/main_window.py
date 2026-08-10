@@ -8,6 +8,7 @@ from PyQt5.QtCore import Qt, QSettings, QThreadPool, QTimer
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -59,8 +60,10 @@ class MainWindow(QMainWindow):
         self.clients_map: Dict[str, Set[str]] = defaultdict(set)
         self._pmkid_aps: Set[str] = set()
         self._reported_twins: Set[str] = set()
-        self._rssi_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=300))
+        self._rssi_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=600))
         self._locator_keys: List[str] = []
+        self._locator_locked_channel: Optional[int] = None
+        self._locator_tab_index = -1
         self._pnl: Dict[str, Set[str]] = defaultdict(set)
         self._auto_capture_bssid: Optional[str] = None
         self.db_path = db_path
@@ -89,6 +92,11 @@ class MainWindow(QMainWindow):
         self._auto_capture_timer = QTimer(self)
         self._auto_capture_timer.setSingleShot(True)
         self._auto_capture_timer.timeout.connect(self._on_auto_capture_timeout)
+        # Fast locator refresh so approach/recession reads out near real-time.
+        self._locator_timer = QTimer(self)
+        self._locator_timer.setInterval(250)
+        self._locator_timer.timeout.connect(self._refresh_locator_readout)
+        self._locator_timer.start()
 
     def _setup_ui(self) -> None:
         central = QWidget()
@@ -262,6 +270,12 @@ class MainWindow(QMainWindow):
         self.locator_combo = QComboBox()
         self.locator_combo.setPlaceholderText("Выберите точку или клиента")
         locator_controls.addWidget(self.locator_combo, 1)
+        self.locator_lock_cb = QCheckBox("Зафиксировать канал цели (плотные замеры)")
+        self.locator_lock_cb.setToolTip(
+            "Останавливает перебор каналов и держит монитор на канале цели — "
+            "beacon'ы приходят непрерывно, RSSI обновляется гораздо чаще"
+        )
+        locator_controls.addWidget(self.locator_lock_cb)
         locator_layout.addLayout(locator_controls)
 
         self.rssi_plot = RssiPlot()
@@ -287,7 +301,7 @@ class MainWindow(QMainWindow):
         hint.setWordWrap(True)
         locator_layout.addWidget(hint)
         locator_tab.setLayout(locator_layout)
-        self.tabs.addTab(locator_tab, "Локатор")
+        self._locator_tab_index = self.tabs.addTab(locator_tab, "Локатор")
 
         layout.addWidget(self.tabs)
 
@@ -348,6 +362,7 @@ class MainWindow(QMainWindow):
         self.crack_stop_btn.clicked.connect(self._on_crack_stop)
         self.controller.crack_state_changed.connect(self._on_crack_state)
         self.controller.crack_cracked.connect(self._on_crack_cracked)
+        self.locator_lock_cb.toggled.connect(self._on_locator_lock_toggled)
 
     def _populate_from_db(self) -> None:
         for ap in self.controller.load_access_points():
@@ -421,6 +436,7 @@ class MainWindow(QMainWindow):
 
         def ok(_) -> None:
             self._capture_running = True
+            self._locator_locked_channel = None
             self.stop_capture_btn.setEnabled(True)
 
         self._run_async(
@@ -435,6 +451,7 @@ class MainWindow(QMainWindow):
 
         def ok(_) -> None:
             self._capture_running = False
+            self._locator_locked_channel = None
             self.start_capture_btn.setEnabled(True)
 
         self._run_async(
@@ -965,6 +982,7 @@ class MainWindow(QMainWindow):
         return items
 
     def _update_locator(self) -> None:
+        # Slow path (1s): keep the target list in sync, then refresh the readout.
         targets = self._locator_targets()
         keys = [key for _, key in targets]
         if keys != self._locator_keys:
@@ -979,7 +997,49 @@ class MainWindow(QMainWindow):
                 if idx >= 0:
                     self.locator_combo.setCurrentIndex(idx)
             self.locator_combo.blockSignals(False)
+        self._refresh_locator_readout()
 
+    def _target_channel(self, target: Optional[str]) -> Optional[int]:
+        if not target:
+            return None
+        record = self.ap_records.get(target)
+        if record is None:
+            station = self.station_records.get(target)
+            bssid = station.get("associated_bssid") if station else None
+            record = self.ap_records.get(bssid) if bssid else None
+        channel = record.get("channel") if record else None
+        try:
+            return int(channel) if channel else None
+        except (TypeError, ValueError):
+            return None
+
+    def _on_locator_lock_toggled(self, checked: bool) -> None:
+        if checked:
+            self._apply_locator_lock()
+        else:
+            self._locator_locked_channel = None
+            try:
+                self.controller.unlock_monitor_channel()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _apply_locator_lock(self) -> None:
+        if not self.locator_lock_cb.isChecked():
+            return
+        channel = self._target_channel(self.locator_combo.currentData())
+        if not channel or channel == self._locator_locked_channel:
+            return
+        self._locator_locked_channel = channel
+        self._run_async(
+            lambda: self.controller.lock_monitor_channel(channel),
+            on_error=lambda: setattr(self, "_locator_locked_channel", None),
+        )
+
+    def _refresh_locator_readout(self) -> None:
+        # Fast path (250ms): only when the locator tab is visible.
+        if self.tabs.currentIndex() != self._locator_tab_index:
+            return
+        self._apply_locator_lock()
         target = self.locator_combo.currentData()
         history = list(self._rssi_history.get(target, [])) if target else []
         self.rssi_plot.set_series(history)
@@ -988,17 +1048,18 @@ class MainWindow(QMainWindow):
             self.locator_bar.setValue(0)
             self.locator_trend.setText("")
             return
-        current_rssi = history[-1][1]
+        now, current_rssi = history[-1]
         self.locator_value.setText(f"{current_rssi} dBm")
         self.locator_bar.setValue(max(0, min(100, int((current_rssi + 90) / 60 * 100))))
-        if len(history) >= 5:
-            delta = current_rssi - history[-5][1]
-            if delta >= 2:
-                self.locator_trend.setText("↑ теплее")
-            elif delta <= -2:
-                self.locator_trend.setText("↓ холоднее")
-            else:
-                self.locator_trend.setText("→ стабильно")
+        cutoff = now - 3.0
+        reference = next((rssi for ts, rssi in history if ts >= cutoff), current_rssi)
+        delta = current_rssi - reference
+        if delta >= 2:
+            self.locator_trend.setText(f"↑ теплее (+{delta} dB)")
+        elif delta <= -2:
+            self.locator_trend.setText(f"↓ холоднее ({delta} dB)")
+        else:
+            self.locator_trend.setText("→ стабильно")
 
     def _check_evil_twins(self) -> None:
         twins = find_evil_twins(self.ap_records.values())

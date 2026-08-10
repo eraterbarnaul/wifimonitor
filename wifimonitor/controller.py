@@ -308,6 +308,15 @@ class WifiMonitorController(QObject):
             self.monitor_service.lock_channel(channel)
         request_pmkid(monitor_interface, bssid, essid=essid or "", channel=channel, log=self._log)
 
+    def lock_monitor_channel(self, channel: int) -> bool:
+        if self.monitor_service and channel:
+            return self.monitor_service.lock_channel(int(channel))
+        return False
+
+    def unlock_monitor_channel(self) -> None:
+        if self.monitor_service:
+            self.monitor_service.unlock_channel()
+
     def _ensure_monitor_interface(self) -> str:
         if not self.base_interface:
             raise ValueError("Не выбран интерфейс")

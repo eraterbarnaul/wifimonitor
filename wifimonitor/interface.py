@@ -2,20 +2,33 @@ import re
 import subprocess
 from typing import List, Optional
 
+# Default timeout for subprocess calls (seconds)
+_DEFAULT_TIMEOUT = 30
+
 
 class InterfaceManager:
-    def __init__(self, monitor_interface: Optional[str] = None) -> None:
+    def __init__(self, monitor_interface: Optional[str] = None, timeout: float = _DEFAULT_TIMEOUT) -> None:
         self.base_interface: Optional[str] = None
         self.monitor_interface = monitor_interface
         self._auto_started = False
+        self._timeout = timeout
+        # Dual-interface support
+        self.secondary_interface: Optional[str] = None
+        self._secondary_monitor: Optional[str] = None
 
     def set_base_interface(self, interface: str) -> None:
         self.base_interface = interface
         self.monitor_interface = interface
         self._auto_started = False
 
+    def set_secondary_interface(self, interface: str) -> None:
+        """Set a secondary interface for injection (dual-adapter mode)."""
+        self.secondary_interface = interface
+
     def ensure_monitor_mode(self, interface: Optional[str] = None) -> str:
-        if interface:
+        if self.monitor_interface and self._is_monitor_mode(self.monitor_interface):
+            return self.monitor_interface
+        if interface and interface != self.base_interface:
             self.set_base_interface(interface)
         if not self.base_interface:
             raise ValueError("Не указан интерфейс для активации мониторного режима")
@@ -28,6 +41,24 @@ class InterfaceManager:
         self.monitor_interface = monitor_iface
         self._auto_started = True
         return monitor_iface
+
+    def ensure_secondary_monitor(self) -> Optional[str]:
+        """Put the secondary interface in monitor mode (for dual-adapter injection)."""
+        if not self.secondary_interface:
+            return None
+        if self._is_monitor_mode(self.secondary_interface):
+            self._secondary_monitor = self.secondary_interface
+            return self._secondary_monitor
+        output = self._start_monitor_mode(self.secondary_interface)
+        mon = self._parse_monitor_interface(output) or f"{self.secondary_interface}mon"
+        self._secondary_monitor = mon
+        return mon
+
+    def get_injection_interface(self) -> Optional[str]:
+        """Return the best interface for injection (secondary if available, else primary)."""
+        if self._secondary_monitor and self._is_monitor_mode(self._secondary_monitor):
+            return self._secondary_monitor
+        return self.monitor_interface
 
     def enable_monitor_mode(self) -> str:
         return self.ensure_monitor_mode()
@@ -43,6 +74,12 @@ class InterfaceManager:
             raise RuntimeError(message)
         self.monitor_interface = self.base_interface
         self._auto_started = False
+
+    def disable_secondary_monitor(self) -> None:
+        """Stop monitor mode on the secondary interface."""
+        if self._secondary_monitor:
+            self._run_command(["airmon-ng", "stop", self._secondary_monitor], check=False)
+            self._secondary_monitor = None
 
     def get_active_interface(self) -> Optional[str]:
         return self.monitor_interface
@@ -107,7 +144,17 @@ class InterfaceManager:
 
     def _run_command(self, command: List[str], check: bool = True) -> subprocess.CompletedProcess:
         try:
-            process = subprocess.run(command, capture_output=True, text=True, check=False)
+            process = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=self._timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"Команда '{' '.join(command)}' превысила таймаут ({self._timeout} с)"
+            ) from exc
         except FileNotFoundError as exc:
             raise FileNotFoundError(f"Команда '{command[0]}' не найдена. Установите необходимые утилиты.") from exc
         if check and process.returncode != 0:

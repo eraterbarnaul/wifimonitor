@@ -1,8 +1,6 @@
 """Headless capture runner for unattended surveys (no GUI, no Qt).
 
-Reuses the capture/database/report layers directly so it can run on a server or
-drone. Heavy imports (scapy via capture) are deferred into ``run`` so argument
-parsing stays importable without a wireless stack.
+Reuses the shared use-case layer so it gets the same logic as the GUI.
 
 Example::
 
@@ -13,6 +11,8 @@ Example::
 from __future__ import annotations
 
 import argparse
+import threading
+import time
 from typing import List, Optional
 
 
@@ -37,54 +37,54 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-monitor-setup", action="store_true",
         help="interface is already in monitor mode (skip airmon-ng)",
     )
+    parser.add_argument(
+        "--secondary", default="",
+        help="secondary interface for injection (dual-adapter mode)",
+    )
     return parser
 
 
 def run(args: argparse.Namespace) -> int:
     import logging
-    import threading
-    import time
     from pathlib import Path
 
-    from .capture import MonitorService
-    from .database import DatabaseManager
-    from .interface import InterfaceManager
+    from .events import EventBus, Events
     from .logging_setup import configure_logging
-    from .report import build_html_report
+    from .usecases import MonitorUseCase
 
     configure_logging(Path.home() / ".wifimonitor")
     log = logging.getLogger("wifimonitor")
 
-    db = DatabaseManager(Path(args.db))
     capture_dir = Path(args.captures)
     capture_dir.mkdir(parents=True, exist_ok=True)
 
-    interface_manager = InterfaceManager()
-    interface = args.interface
-    if not args.no_monitor_setup:
-        interface = interface_manager.ensure_monitor_mode(args.interface)
+    bus = EventBus()
+    uc = MonitorUseCase(db_path=Path(args.db), capture_dir=capture_dir, bus=bus)
 
     stop = threading.Event()
     counters = {"handshakes": 0}
 
-    def on_handshake(handshake) -> None:
-        db.add_handshake(handshake)
+    def on_handshake(data: dict) -> None:
         counters["handshakes"] += 1
-        log.info("capture %s %s <-> %s (%s)", handshake.kind, handshake.bssid,
-                 handshake.station_mac, handshake.quality)
+        log.info("capture %s %s <-> %s (%s)", data.get("kind"), data.get("bssid"),
+                 data.get("station_mac"), data.get("quality"))
         if args.handshakes and counters["handshakes"] >= args.handshakes:
             stop.set()
 
-    service = MonitorService(
-        interface=interface,
-        capture_dir=capture_dir,
-        on_access_point=db.upsert_access_point,
-        on_station=db.upsert_station,
-        on_handshake=on_handshake,
-        on_log=log.info,
-    )
-    log.info("headless capture on %s", interface)
-    service.start()
+    bus.subscribe(Events.HANDSHAKE_CAPTURED, on_handshake)
+
+    # Setup interface
+    uc.set_interface(args.interface)
+    if args.secondary:
+        uc.set_secondary_interface(args.secondary)
+
+    if args.no_monitor_setup:
+        uc.interface_manager.monitor_interface = args.interface
+        uc.interface_manager._auto_started = False
+
+    log.info("headless capture on %s", args.interface)
+    uc.start_capture()
+
     deadline = time.time() + args.duration if args.duration > 0 else None
     try:
         while not stop.is_set():
@@ -94,21 +94,11 @@ def run(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         log.info("interrupted")
     finally:
-        service.stop()
-        if not args.no_monitor_setup:
-            try:
-                interface_manager.disable_monitor_mode()
-            except Exception as exc:  # noqa: BLE001
-                log.warning("could not disable monitor mode: %s", exc)
+        uc.stop_capture()
 
     log.info("captured %d handshake(s)", counters["handshakes"])
     if args.report:
-        access_points = [dict(row) for row in db.fetch_access_points()]
-        stations = [dict(row) for row in db.fetch_stations()]
-        handshakes = [dict(row) for row in db.fetch_handshakes()]
-        Path(args.report).write_text(
-            build_html_report(access_points, stations, handshakes), encoding="utf-8"
-        )
+        uc.export_report(Path(args.report))
         log.info("report written to %s", args.report)
     return 0
 

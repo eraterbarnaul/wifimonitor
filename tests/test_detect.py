@@ -21,7 +21,8 @@ def test_deauth_flood_respects_window():
 
 def test_deauth_flood_cooldown():
     det = DeauthFloodDetector(window=5.0, threshold=3, cooldown=10.0)
-    det.add(0.0); det.add(0.1)
+    det.add(0.0)
+    det.add(0.1)
     assert det.add(0.2) is not None      # first alert
     assert det.add(0.3) is None          # still in cooldown
     assert det.add(11.0) is not None or True  # window emptied; not asserting exact

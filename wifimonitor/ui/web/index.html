@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wifimonitor — Remote Control</title>
+<style>
+:root { --bg: #0d1117; --card: #161b22; --border: #30363d; --text: #c9d1d9; --accent: #58a6ff; --green: #3fb950; --red: #f85149; --orange: #d29922; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); padding: 16px; }
+h1 { font-size: 1.5rem; margin-bottom: 12px; color: var(--accent); }
+h2 { font-size: 1.1rem; margin: 16px 0 8px; color: var(--text); border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+.controls { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+button { background: var(--card); border: 1px solid var(--border); color: var(--text); padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 0.9rem; }
+button:hover { border-color: var(--accent); color: var(--accent); }
+button.active { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+button.danger { border-color: var(--red); color: var(--red); }
+button.danger:hover { background: var(--red); color: #fff; }
+.status { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 12px; margin-bottom: 12px; }
+.status .indicator { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; }
+.status .on { background: var(--green); }
+.status .off { background: var(--red); }
+table { width: 100%; border-collapse: collapse; font-size: 0.85rem; background: var(--card); border-radius: 6px; overflow: hidden; }
+th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); }
+th { background: #1c2128; color: var(--accent); font-weight: 600; }
+tr:hover td { background: #1c2128; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; }
+.badge-wpa3 { background: #1f6feb33; color: var(--accent); }
+.badge-wpa2 { background: #d2992233; color: var(--orange); }
+.badge-open { background: #f8514933; color: var(--red); }
+.badge-wifi6 { background: #3fb95033; color: var(--green); }
+.badge-wifi7 { background: #a371f733; color: #a371f7; }
+.log { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 8px; max-height: 200px; overflow-y: auto; font-family: monospace; font-size: 0.8rem; white-space: pre-wrap; }
+.input-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+.input-row input, .input-row select { background: var(--card); border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 4px; }
+.stats { display: flex; gap: 16px; margin-bottom: 12px; }
+.stat-box { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 12px 16px; text-align: center; }
+.stat-box .value { font-size: 1.5rem; font-weight: 700; color: var(--accent); }
+.stat-box .label { font-size: 0.75rem; color: #8b949e; margin-top: 4px; }
+@media (max-width: 600px) { .stats { flex-direction: column; } }
+</style>
+</head>
+<body>
+<h1>Wifimonitor Remote</h1>
+
+<div class="status" id="status">
+    <span class="indicator off" id="indicator"></span>
+    <span id="status-text">Не подключено</span>
+</div>
+
+<div class="stats">
+    <div class="stat-box"><div class="value" id="ap-count">0</div><div class="label">Точек доступа</div></div>
+    <div class="stat-box"><div class="value" id="sta-count">0</div><div class="label">Клиентов</div></div>
+    <div class="stat-box"><div class="value" id="hs-count">0</div><div class="label">Захватов</div></div>
+</div>
+
+<div class="controls">
+    <button id="btn-start" onclick="apiPost('/api/start')">Старт</button>
+    <button id="btn-stop" onclick="apiPost('/api/stop')">Стоп</button>
+    <button onclick="refresh()">Обновить</button>
+</div>
+
+<h2>Точки доступа</h2>
+<table id="ap-table">
+    <thead><tr><th>BSSID</th><th>ESSID</th><th>Канал</th><th>Полоса</th><th>Wi-Fi</th><th>Шифрование</th><th>Сигнал</th><th>WPS</th></tr></thead>
+    <tbody></tbody>
+</table>
+
+<h2>Handshakes</h2>
+<table id="hs-table">
+    <thead><tr><th>BSSID</th><th>Клиент</th><th>Тип</th><th>Качество</th><th>Создан</th></tr></thead>
+    <tbody></tbody>
+</table>
+
+<h2>Деаутентификация</h2>
+<div class="input-row">
+    <input id="deauth-bssid" placeholder="BSSID цели">
+    <input id="deauth-client" placeholder="MAC клиента">
+    <button onclick="startDeauth()">Deauth</button>
+    <button class="danger" onclick="apiPost('/api/deauth/stop')">Стоп Deauth</button>
+</div>
+
+<h2>Лог</h2>
+<div class="log" id="log"></div>
+
+<script>
+const BASE = window.location.origin;
+let refreshInterval;
+
+async function apiGet(path) {
+    try {
+        const r = await fetch(BASE + path);
+        return await r.json();
+    } catch (e) {
+        log('Ошибка: ' + e.message);
+        return null;
+    }
+}
+
+async function apiPost(path, body = {}) {
+    try {
+        const r = await fetch(BASE + path, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body)
+        });
+        const data = await r.json();
+        log(JSON.stringify(data));
+        refresh();
+        return data;
+    } catch (e) {
+        log('Ошибка: ' + e.message);
+    }
+}
+
+function encBadge(enc) {
+    if (!enc) return '<span class="badge badge-open">OPEN</span>';
+    if (enc.includes('WPA3')) return `<span class="badge badge-wpa3">${enc}</span>`;
+    return `<span class="badge badge-wpa2">${enc}</span>`;
+}
+
+function wifiBadge(gen) {
+    if (!gen) return '';
+    if (gen === '7') return '<span class="badge badge-wifi7">Wi-Fi 7</span>';
+    if (gen === '6' || gen === '6E') return `<span class="badge badge-wifi6">Wi-Fi ${gen}</span>`;
+    return `Wi-Fi ${gen}`;
+}
+
+async function refresh() {
+    const status = await apiGet('/api/status');
+    if (status) {
+        const ind = document.getElementById('indicator');
+        const txt = document.getElementById('status-text');
+        if (status.monitoring) {
+            ind.className = 'indicator on';
+            txt.textContent = `Мониторинг на ${status.interface || '?'}`;
+        } else {
+            ind.className = 'indicator off';
+            txt.textContent = 'Остановлено';
+        }
+        document.getElementById('ap-count').textContent = status.ap_count || 0;
+    }
+
+    const aps = await apiGet('/api/access_points');
+    if (aps) {
+        const tbody = document.querySelector('#ap-table tbody');
+        tbody.innerHTML = aps.map(ap => `<tr>
+            <td>${ap.bssid || ''}</td>
+            <td>${ap.essid || '<hidden>'}</td>
+            <td>${ap.channel || ''}</td>
+            <td>${ap.bandwidth ? ap.bandwidth + ' МГц' : ''}</td>
+            <td>${wifiBadge(ap.wifi_generation)}</td>
+            <td>${encBadge(ap.encryption)}</td>
+            <td>${ap.signal || ''} dBm</td>
+            <td>${ap.wps ? 'да' : ''}</td>
+        </tr>`).join('');
+    }
+
+    const stations = await apiGet('/api/stations');
+    if (stations) {
+        document.getElementById('sta-count').textContent = stations.length;
+    }
+
+    const hs = await apiGet('/api/handshakes');
+    if (hs) {
+        document.getElementById('hs-count').textContent = hs.length;
+        const tbody = document.querySelector('#hs-table tbody');
+        tbody.innerHTML = hs.slice(0, 50).map(h => `<tr>
+            <td>${h.bssid || ''}</td>
+            <td>${h.station_mac || ''}</td>
+            <td>${h.kind || ''}</td>
+            <td>${h.quality || ''}</td>
+            <td>${h.created_at || ''}</td>
+        </tr>`).join('');
+    }
+}
+
+async function startDeauth() {
+    const bssid = document.getElementById('deauth-bssid').value.trim();
+    const client = document.getElementById('deauth-client').value.trim();
+    if (!bssid) { alert('Укажите BSSID'); return; }
+    await apiPost('/api/deauth', { bssid, clients: client ? [client] : [], packets: 10, interval: 1.0 });
+}
+
+function log(msg) {
+    const el = document.getElementById('log');
+    const ts = new Date().toLocaleTimeString();
+    el.textContent += `[${ts}] ${msg}\n`;
+    el.scrollTop = el.scrollHeight;
+}
+
+// Auto-refresh every 3 seconds
+refresh();
+refreshInterval = setInterval(refresh, 3000);
+</script>
+</body>
+</html>

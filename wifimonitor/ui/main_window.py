@@ -8,6 +8,7 @@ from PyQt5.QtCore import Qt, QSettings, QThreadPool, QTimer
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -59,8 +60,10 @@ class MainWindow(QMainWindow):
         self.clients_map: Dict[str, Set[str]] = defaultdict(set)
         self._pmkid_aps: Set[str] = set()
         self._reported_twins: Set[str] = set()
-        self._rssi_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=300))
+        self._rssi_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=600))
         self._locator_keys: List[str] = []
+        self._locator_locked_channel: Optional[int] = None
+        self._locator_tab_index = -1
         self._pnl: Dict[str, Set[str]] = defaultdict(set)
         self._auto_capture_bssid: Optional[str] = None
         self.db_path = db_path
@@ -70,7 +73,7 @@ class MainWindow(QMainWindow):
         self._targets_dirty = False
         self._capture_running = False
         self._filter_text = ""
-        self._ap_sort_col = 7  # "Обновлено" by default
+        self._ap_sort_col = 9  # "Обновлено" by default
         self._ap_sort_desc = True
         self._pool = QThreadPool.globalInstance()
         self._active_workers: Set[Worker] = set()
@@ -89,6 +92,11 @@ class MainWindow(QMainWindow):
         self._auto_capture_timer = QTimer(self)
         self._auto_capture_timer.setSingleShot(True)
         self._auto_capture_timer.timeout.connect(self._on_auto_capture_timeout)
+        # Fast locator refresh so approach/recession reads out near real-time.
+        self._locator_timer = QTimer(self)
+        self._locator_timer.setInterval(250)
+        self._locator_timer.timeout.connect(self._refresh_locator_readout)
+        self._locator_timer.start()
 
     def _setup_ui(self) -> None:
         central = QWidget()
@@ -101,6 +109,13 @@ class MainWindow(QMainWindow):
         self.interface_combo.setPlaceholderText("Выберите интерфейс")
         control_layout.addWidget(QLabel("Интерфейс:"))
         control_layout.addWidget(self.interface_combo)
+
+        self.secondary_combo = QComboBox()
+        self.secondary_combo.setEditable(True)
+        self.secondary_combo.setPlaceholderText("Injection (опц.)")
+        self.secondary_combo.setToolTip("Вторичный адаптер для injection (dual-interface mode)")
+        control_layout.addWidget(QLabel("Injection:"))
+        control_layout.addWidget(self.secondary_combo)
 
         self.refresh_interfaces_btn = QPushButton("Обновить")
         self.set_interface_btn = QPushButton("Применить")
@@ -136,8 +151,8 @@ class MainWindow(QMainWindow):
 
         splitter = QSplitter(Qt.Vertical)
 
-        self.ap_table = QTableWidget(0, 9)
-        self.ap_table.setHorizontalHeaderLabels(["№", "BSSID", "ESSID", "Канал", "Шифрование", "Сигнал", "Клиенты", "Обновлено", "Оценка"])
+        self.ap_table = QTableWidget(0, 11)
+        self.ap_table.setHorizontalHeaderLabels(["№", "BSSID", "ESSID", "Канал", "Полоса", "Wi-Fi", "Шифрование", "Сигнал", "Клиенты", "Обновлено", "Оценка"])
         self.ap_table.horizontalHeader().setStretchLastSection(True)
         self.ap_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.ap_table.horizontalHeader().setSectionsClickable(True)
@@ -262,6 +277,12 @@ class MainWindow(QMainWindow):
         self.locator_combo = QComboBox()
         self.locator_combo.setPlaceholderText("Выберите точку или клиента")
         locator_controls.addWidget(self.locator_combo, 1)
+        self.locator_lock_cb = QCheckBox("Зафиксировать канал цели (плотные замеры)")
+        self.locator_lock_cb.setToolTip(
+            "Останавливает перебор каналов и держит монитор на канале цели — "
+            "beacon'ы приходят непрерывно, RSSI обновляется гораздо чаще"
+        )
+        locator_controls.addWidget(self.locator_lock_cb)
         locator_layout.addLayout(locator_controls)
 
         self.rssi_plot = RssiPlot()
@@ -287,7 +308,28 @@ class MainWindow(QMainWindow):
         hint.setWordWrap(True)
         locator_layout.addWidget(hint)
         locator_tab.setLayout(locator_layout)
-        self.tabs.addTab(locator_tab, "Локатор")
+        self._locator_tab_index = self.tabs.addTab(locator_tab, "Локатор")
+
+        # --- Sessions tab ---
+        sessions_tab = QWidget()
+        sessions_layout = QVBoxLayout()
+        sessions_controls = QHBoxLayout()
+        self.sessions_compare_btn = QPushButton("Сравнить последние 2 сессии")
+        sessions_controls.addWidget(self.sessions_compare_btn)
+        sessions_controls.addStretch()
+        sessions_layout.addLayout(sessions_controls)
+        self.sessions_result = QPlainTextEdit()
+        self.sessions_result.setReadOnly(True)
+        self.sessions_result.setFont(QFont("Fira Code", 10))
+        self.sessions_result.setPlaceholderText("Результат сравнения сессий появится здесь")
+        sessions_layout.addWidget(self.sessions_result)
+        sessions_tab.setLayout(sessions_layout)
+        self.tabs.addTab(sessions_tab, "Сессии")
+
+        # --- GPS indicator (in status bar) ---
+        self.gps_label = QLabel("GPS: —")
+        self.gps_label.setStyleSheet("padding: 0 8px;")
+        self.gps_label.setToolTip("Статус GPS (gpsd)")
 
         layout.addWidget(self.tabs)
 
@@ -311,6 +353,7 @@ class MainWindow(QMainWindow):
         central.setLayout(layout)
         self.setCentralWidget(central)
         self.status_bar = QStatusBar()
+        self.status_bar.addPermanentWidget(self.gps_label)
         self.setStatusBar(self.status_bar)
 
     def _connect_signals(self) -> None:
@@ -348,6 +391,10 @@ class MainWindow(QMainWindow):
         self.crack_stop_btn.clicked.connect(self._on_crack_stop)
         self.controller.crack_state_changed.connect(self._on_crack_state)
         self.controller.crack_cracked.connect(self._on_crack_cracked)
+        self.controller.auto_attack_progress.connect(self._on_auto_attack_progress)
+        self.controller.auto_attack_complete.connect(self._on_auto_attack_complete)
+        self.locator_lock_cb.toggled.connect(self._on_locator_lock_toggled)
+        self.sessions_compare_btn.clicked.connect(self._on_compare_sessions)
 
     def _populate_from_db(self) -> None:
         for ap in self.controller.load_access_points():
@@ -367,6 +414,10 @@ class MainWindow(QMainWindow):
             self._show_error("Укажите интерфейс")
             return
         self.controller.set_interface(interface)
+        # Secondary interface for injection
+        secondary = self.secondary_combo.currentText().strip()
+        if secondary and secondary != interface:
+            self.controller.set_secondary_interface(secondary)
         self._save_settings()
         self.status_bar.showMessage(f"Выбран интерфейс {interface}")
 
@@ -421,6 +472,7 @@ class MainWindow(QMainWindow):
 
         def ok(_) -> None:
             self._capture_running = True
+            self._locator_locked_channel = None
             self.stop_capture_btn.setEnabled(True)
 
         self._run_async(
@@ -435,6 +487,7 @@ class MainWindow(QMainWindow):
 
         def ok(_) -> None:
             self._capture_running = False
+            self._locator_locked_channel = None
             self.start_capture_btn.setEnabled(True)
 
         self._run_async(
@@ -744,26 +797,36 @@ class MainWindow(QMainWindow):
         channel_item.setFlags(channel_item.flags() & ~Qt.ItemIsEditable)
         self.ap_table.setItem(row_idx, 3, channel_item)
 
+        bandwidth_item = QTableWidgetItem(self._to_text(ap.get("bandwidth")))
+        bandwidth_item.setTextAlignment(Qt.AlignCenter)
+        bandwidth_item.setFlags(bandwidth_item.flags() & ~Qt.ItemIsEditable)
+        self.ap_table.setItem(row_idx, 4, bandwidth_item)
+
+        wifi_gen_item = QTableWidgetItem(self._to_text(ap.get("wifi_generation")))
+        wifi_gen_item.setTextAlignment(Qt.AlignCenter)
+        wifi_gen_item.setFlags(wifi_gen_item.flags() & ~Qt.ItemIsEditable)
+        self.ap_table.setItem(row_idx, 5, wifi_gen_item)
+
         encryption_item = QTableWidgetItem(self._to_text(ap.get("encryption")))
         encryption_item.setFlags(encryption_item.flags() & ~Qt.ItemIsEditable)
-        self.ap_table.setItem(row_idx, 4, encryption_item)
+        self.ap_table.setItem(row_idx, 6, encryption_item)
 
         signal_item = QTableWidgetItem(self._to_text(ap.get("signal")))
         signal_item.setTextAlignment(Qt.AlignCenter)
         signal_item.setFlags(signal_item.flags() & ~Qt.ItemIsEditable)
-        self.ap_table.setItem(row_idx, 5, signal_item)
+        self.ap_table.setItem(row_idx, 7, signal_item)
 
         active_clients = len(self._active_clients_for_ap(bssid))
         clients_item = QTableWidgetItem(self._to_text(active_clients))
         clients_item.setTextAlignment(Qt.AlignCenter)
         clients_item.setFlags(clients_item.flags() & ~Qt.ItemIsEditable)
-        self.ap_table.setItem(row_idx, 6, clients_item)
+        self.ap_table.setItem(row_idx, 8, clients_item)
 
         last_seen_dt = ap.get("last_seen_dt")
         last_seen_item = QTableWidgetItem(self._format_time_since(last_seen_dt))
         last_seen_item.setFlags(last_seen_item.flags() & ~Qt.ItemIsEditable)
         last_seen_item.setData(Qt.UserRole, last_seen_dt.timestamp() if last_seen_dt else float("-inf"))
-        self.ap_table.setItem(row_idx, 7, last_seen_item)
+        self.ap_table.setItem(row_idx, 9, last_seen_item)
 
         label, detail = assess(
             ap.get("encryption"),
@@ -777,7 +840,7 @@ class MainWindow(QMainWindow):
         verdict_item.setFlags(verdict_item.flags() & ~Qt.ItemIsEditable)
         verdict_item.setToolTip(detail)
         verdict_item.setData(Qt.UserRole, priority_rank(label))
-        self.ap_table.setItem(row_idx, 8, verdict_item)
+        self.ap_table.setItem(row_idx, 10, verdict_item)
 
     def _set_station_row(self, row_idx: int, mac: str, station: dict) -> None:
         key_item = QTableWidgetItem(mac)
@@ -816,9 +879,6 @@ class MainWindow(QMainWindow):
         self.st_table.setItem(row_idx, 3, last_seen_item)
 
     def _on_tick(self) -> None:
-        # Runs once per second: redraw tables so relative "last seen" values
-        # keep counting, and refresh the deauth target combos only when new
-        # access points or clients arrived since the previous tick.
         self._rebuild_access_point_table()
         self._rebuild_station_table()
         if self._targets_dirty:
@@ -826,6 +886,7 @@ class MainWindow(QMainWindow):
             self._targets_dirty = False
         self._check_evil_twins()
         self._update_locator()
+        self._update_gps_status()
 
     def _on_security_alert(self, message: str) -> None:
         self.status_bar.showMessage(f"⚠ {message}", 10000)
@@ -965,6 +1026,7 @@ class MainWindow(QMainWindow):
         return items
 
     def _update_locator(self) -> None:
+        # Slow path (1s): keep the target list in sync, then refresh the readout.
         targets = self._locator_targets()
         keys = [key for _, key in targets]
         if keys != self._locator_keys:
@@ -979,7 +1041,49 @@ class MainWindow(QMainWindow):
                 if idx >= 0:
                     self.locator_combo.setCurrentIndex(idx)
             self.locator_combo.blockSignals(False)
+        self._refresh_locator_readout()
 
+    def _target_channel(self, target: Optional[str]) -> Optional[int]:
+        if not target:
+            return None
+        record = self.ap_records.get(target)
+        if record is None:
+            station = self.station_records.get(target)
+            bssid = station.get("associated_bssid") if station else None
+            record = self.ap_records.get(bssid) if bssid else None
+        channel = record.get("channel") if record else None
+        try:
+            return int(channel) if channel else None
+        except (TypeError, ValueError):
+            return None
+
+    def _on_locator_lock_toggled(self, checked: bool) -> None:
+        if checked:
+            self._apply_locator_lock()
+        else:
+            self._locator_locked_channel = None
+            try:
+                self.controller.unlock_monitor_channel()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _apply_locator_lock(self) -> None:
+        if not self.locator_lock_cb.isChecked():
+            return
+        channel = self._target_channel(self.locator_combo.currentData())
+        if not channel or channel == self._locator_locked_channel:
+            return
+        self._locator_locked_channel = channel
+        self._run_async(
+            lambda: self.controller.lock_monitor_channel(channel),
+            on_error=lambda: setattr(self, "_locator_locked_channel", None),
+        )
+
+    def _refresh_locator_readout(self) -> None:
+        # Fast path (250ms): only when the locator tab is visible.
+        if self.tabs.currentIndex() != self._locator_tab_index:
+            return
+        self._apply_locator_lock()
         target = self.locator_combo.currentData()
         history = list(self._rssi_history.get(target, [])) if target else []
         self.rssi_plot.set_series(history)
@@ -988,17 +1092,18 @@ class MainWindow(QMainWindow):
             self.locator_bar.setValue(0)
             self.locator_trend.setText("")
             return
-        current_rssi = history[-1][1]
+        now, current_rssi = history[-1]
         self.locator_value.setText(f"{current_rssi} dBm")
         self.locator_bar.setValue(max(0, min(100, int((current_rssi + 90) / 60 * 100))))
-        if len(history) >= 5:
-            delta = current_rssi - history[-5][1]
-            if delta >= 2:
-                self.locator_trend.setText("↑ теплее")
-            elif delta <= -2:
-                self.locator_trend.setText("↓ холоднее")
-            else:
-                self.locator_trend.setText("→ стабильно")
+        cutoff = now - 3.0
+        reference = next((rssi for ts, rssi in history if ts >= cutoff), current_rssi)
+        delta = current_rssi - reference
+        if delta >= 2:
+            self.locator_trend.setText(f"↑ теплее (+{delta} dB)")
+        elif delta <= -2:
+            self.locator_trend.setText(f"↓ холоднее ({delta} dB)")
+        else:
+            self.locator_trend.setText("→ стабильно")
 
     def _check_evil_twins(self) -> None:
         twins = find_evil_twins(self.ap_records.values())
@@ -1147,6 +1252,20 @@ class MainWindow(QMainWindow):
         elif interfaces:
             self.interface_combo.setCurrentIndex(0)
         self.interface_combo.blockSignals(False)
+        # Also populate secondary interface combo
+        sec_current = self.secondary_combo.currentText().strip()
+        self.secondary_combo.blockSignals(True)
+        self.secondary_combo.clear()
+        self.secondary_combo.addItem("")  # Empty = no secondary
+        if interfaces:
+            self.secondary_combo.addItems(interfaces)
+        if sec_current:
+            idx = self.secondary_combo.findText(sec_current)
+            if idx >= 0:
+                self.secondary_combo.setCurrentIndex(idx)
+            else:
+                self.secondary_combo.setEditText(sec_current)
+        self.secondary_combo.blockSignals(False)
 
     def _on_refresh_interfaces(self) -> None:
         self.refresh_interfaces_btn.setEnabled(False)
@@ -1215,16 +1334,15 @@ class MainWindow(QMainWindow):
             return
         client_value = self.target_client_combo.currentData()
         clients = [client_value] if client_value else sorted(self._active_clients_for_ap(bssid))
-        if not clients:
-            self._show_error("Активные клиенты не найдены")
-            return
         essid = self.ap_records.get(bssid, {}).get("essid") or bssid
+        channel = self.ap_records.get(bssid, {}).get("channel")
         reply = QMessageBox.question(
             self,
             "Авто-захват",
-            f"Запустить авто-захват для сети «{essid}»?\n\n"
-            "Будет выполнена деаутентификация клиентов для получения handshake/PMKID, "
-            "после чего первый захват автоматически экспортируется в hashcat 22000.\n"
+            f"Запустить авто-атаку для сети «{essid}»?\n\n"
+            "Будет выполнен запрос PMKID, затем деаутентификация клиентов для\n"
+            "получения handshake, после чего захват автоматически экспортируется\n"
+            "в hashcat 22000.\n"
             "Убедитесь, что у вас есть разрешение на тестирование этой сети.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -1233,18 +1351,13 @@ class MainWindow(QMainWindow):
             return
         self._save_settings()
         try:
-            self.controller.start_deauth(
-                bssid,
-                clients,
-                self.deauth_count_spin.value(),
-                self.deauth_interval_spin.value(),
-            )
+            self.controller.start_auto_attack(bssid, clients, channel=channel, essid=essid)
         except Exception as exc:
             self._show_error(str(exc))
             return
         self._auto_capture_bssid = bssid
-        self._auto_capture_timer.start(self.AUTO_CAPTURE_TIMEOUT_MS)
-        self.status_bar.showMessage(f"Авто-захват запущен для {essid}", 5000)
+        self.auto_capture_btn.setEnabled(False)
+        self.status_bar.showMessage(f"Авто-атака запущена для {essid}", 5000)
 
     def _finish_auto_capture(self, handshake: dict) -> None:
         self._auto_capture_timer.stop()
@@ -1283,6 +1396,18 @@ class MainWindow(QMainWindow):
             pass
         self.status_bar.showMessage("Авто-захват: handshake не пойман, остановлено", 8000)
 
+    def _on_auto_attack_progress(self, phase: str, message: str) -> None:
+        self.status_bar.showMessage(f"[Авто-атака] {phase}: {message}", 5000)
+        self._append_log(f"[auto-attack] {phase}: {message}")
+
+    def _on_auto_attack_complete(self, success: bool, message: str) -> None:
+        self._auto_capture_bssid = None
+        self.auto_capture_btn.setEnabled(True)
+        if success:
+            self.status_bar.showMessage(f"Авто-атака завершена: {message}", 10000)
+        else:
+            self.status_bar.showMessage(f"Авто-атака не удалась: {message}", 10000)
+
     def _on_deauth_state(self, running: bool) -> None:
         self.start_deauth_btn.setEnabled(not running)
         self.stop_deauth_btn.setEnabled(running)
@@ -1302,6 +1427,9 @@ class MainWindow(QMainWindow):
         iface = self._settings.value("interface", "", type=str)
         if iface:
             self.interface_combo.setEditText(iface)
+        sec_iface = self._settings.value("secondary_interface", "", type=str)
+        if sec_iface:
+            self.secondary_combo.setEditText(sec_iface)
         self.deauth_count_spin.setValue(
             self._settings.value("deauth/count", self.deauth_count_spin.value(), type=int)
         )
@@ -1311,8 +1439,53 @@ class MainWindow(QMainWindow):
 
     def _save_settings(self) -> None:
         self._settings.setValue("interface", self.interface_combo.currentText().strip())
+        self._settings.setValue("secondary_interface", self.secondary_combo.currentText().strip())
         self._settings.setValue("deauth/count", self.deauth_count_spin.value())
         self._settings.setValue("deauth/interval", self.deauth_interval_spin.value())
+
+    def _on_compare_sessions(self) -> None:
+        """Compare the last two sessions and display diff."""
+        sessions = self.controller.db.fetch_sessions()
+        if len(sessions) < 2:
+            self.sessions_result.setPlainText("Недостаточно сессий для сравнения (нужно минимум 2).")
+            return
+        s1_id = sessions[1]["id"]  # older
+        s2_id = sessions[0]["id"]  # newer
+        diff = self.controller.db.compare_sessions(s1_id, s2_id)
+        lines = []
+        lines.append(f"Сравнение сессий #{s1_id} → #{s2_id}")
+        lines.append("=" * 50)
+        if diff["new"]:
+            lines.append(f"\n  Новые AP ({len(diff['new'])}):")
+            for ap in diff["new"]:
+                lines.append(f"    + {ap.get('bssid')} — {ap.get('essid') or '<hidden>'} (канал {ap.get('channel')})")
+        if diff["gone"]:
+            lines.append(f"\n  Исчезнувшие AP ({len(diff['gone'])}):")
+            for ap in diff["gone"]:
+                lines.append(f"    - {ap.get('bssid')} — {ap.get('essid') or '<hidden>'} (канал {ap.get('channel')})")
+        if diff["changed"]:
+            lines.append(f"\n  Изменённые AP ({len(diff['changed'])}):")
+            for item in diff["changed"]:
+                lines.append(f"    ~ {item['bssid']}:")
+                for field, vals in item["changes"].items():
+                    lines.append(f"        {field}: {vals['before']} → {vals['after']}")
+        if not diff["new"] and not diff["gone"] and not diff["changed"]:
+            lines.append("\n  Изменений не обнаружено.")
+        self.sessions_result.setPlainText("\n".join(lines))
+
+    def _update_gps_status(self) -> None:
+        """Update GPS indicator in status bar."""
+        uc = getattr(self.controller, '_uc', None)
+        if not uc or not uc.gps_reader:
+            self.gps_label.setText("GPS: —")
+            return
+        coord = uc.gps_reader.current_position()
+        if coord:
+            self.gps_label.setText(f"GPS: {coord.latitude:.5f}, {coord.longitude:.5f}")
+            self.gps_label.setStyleSheet("padding: 0 8px; color: #3fb950;")
+        else:
+            self.gps_label.setText("GPS: нет фикса")
+            self.gps_label.setStyleSheet("padding: 0 8px; color: #d29922;")
 
     def closeEvent(self, event) -> None:  # type: ignore
         try:

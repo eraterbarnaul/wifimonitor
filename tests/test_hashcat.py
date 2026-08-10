@@ -86,8 +86,8 @@ def test_build_lines_pmkid_and_eapol_m1_m2():
     lines = build_hash_lines(frames, ESSID)
     assert len(lines) == 2
 
-    pmkid_l = next(l for l in lines if l.startswith("WPA*01"))
-    eapol_l = next(l for l in lines if l.startswith("WPA*02"))
+    pmkid_l = next(line for line in lines if line.startswith("WPA*01"))
+    eapol_l = next(line for line in lines if line.startswith("WPA*02"))
 
     p = pmkid_l.split("*")
     assert len(p) == 9

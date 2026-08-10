@@ -4,12 +4,14 @@ This is a small, high-confidence subset aimed at spotting common device classes
 during an audit (IoT boards, virtual machines, well-known network gear). It is
 intentionally short; for full coverage point ``load_oui_file`` at an IEEE
 ``oui.txt`` / Wireshark ``manuf`` file.
+
+Extended: automatically loads system OUI files at import time if available.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 _BUILTIN: Dict[str, str] = {
     # Virtualization
@@ -35,9 +37,48 @@ _BUILTIN: Dict[str, str] = {
     "0418D6": "Ubiquiti",
     "24A43C": "Ubiquiti",
     "DC9FDB": "Ubiquiti",
+    # Apple
+    "A4B197": "Apple",
+    "F0D1A9": "Apple",
+    "38C986": "Apple",
+    "70DEE2": "Apple",
+    "3CE072": "Apple",
+    # Samsung
+    "A8F274": "Samsung",
+    "C44602": "Samsung",
+    "8C71F8": "Samsung",
+    # Intel
+    "8086F2": "Intel",
+    "A4C494": "Intel",
+    "7C5CF8": "Intel",
+    # TP-Link
+    "10FEED": "TP-Link",
+    "5C628B": "TP-Link",
+    "C006C3": "TP-Link",
+    # Netgear
+    "A42B8C": "Netgear",
+    "B07FB9": "Netgear",
+    # Huawei
+    "00E0FC": "Huawei",
+    "0034FE": "Huawei",
+    "0025D3": "Huawei",
+    "001882": "Huawei",
+    # Xiaomi
+    "28E31F": "Xiaomi",
+    "7CE9D3": "Xiaomi",
 }
 
 _TABLE: Dict[str, str] = dict(_BUILTIN)
+
+# Standard system paths for OUI/manuf files
+_SYSTEM_OUI_PATHS: List[str] = [
+    "/usr/share/wireshark/manuf",
+    "/usr/share/nmap/nmap-mac-prefixes",
+    "/usr/share/arp-scan/ieee-oui.txt",
+    "/etc/manuf",
+    "/usr/local/share/wireshark/manuf",
+    "/usr/share/misc/oui.txt",
+]
 
 
 def lookup_vendor(mac: Optional[str]) -> str:
@@ -70,7 +111,11 @@ def load_oui_file(path: Path) -> int:
     skipped.
     """
     added = 0
-    for raw in Path(path).read_text(encoding="utf-8", errors="ignore").splitlines():
+    try:
+        content = Path(path).read_text(encoding="utf-8", errors="ignore")
+    except (OSError, PermissionError):
+        return 0
+    for raw in content.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -82,3 +127,50 @@ def load_oui_file(path: Path) -> int:
             _TABLE[prefix] = parts[1].strip()
             added += 1
     return added
+
+
+def load_nmap_prefixes(path: Path) -> int:
+    """Load nmap-mac-prefixes format (6-char-hex followed by vendor name)."""
+    added = 0
+    try:
+        content = Path(path).read_text(encoding="utf-8", errors="ignore")
+    except (OSError, PermissionError):
+        return 0
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if len(line) < 7:
+            continue
+        prefix = line[:6].upper()
+        if all(c in "0123456789ABCDEF" for c in prefix):
+            vendor = line[7:].strip() if len(line) > 7 else line[6:].strip()
+            if vendor:
+                _TABLE[prefix] = vendor
+                added += 1
+    return added
+
+
+def auto_load_system_oui() -> int:
+    """Try to load OUI data from common system locations. Returns total entries added."""
+    total = 0
+    for path_str in _SYSTEM_OUI_PATHS:
+        path = Path(path_str)
+        if not path.exists():
+            continue
+        if "nmap-mac-prefixes" in path_str:
+            total += load_nmap_prefixes(path)
+        else:
+            total += load_oui_file(path)
+        if total > 1000:
+            break  # Got a good source, no need to load more
+    return total
+
+
+def table_size() -> int:
+    """Return the number of entries in the OUI table."""
+    return len(_TABLE)
+
+
+# Auto-load on import (best-effort, silent on failure)
+auto_load_system_oui()

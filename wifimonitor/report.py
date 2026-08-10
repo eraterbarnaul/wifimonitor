@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime, timezone
 from html import escape
-from typing import Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 from .audit import assess
 from .oui import is_randomized_mac, lookup_vendor
@@ -47,6 +47,8 @@ def build_html_report(
     handshakes: Sequence[dict],
     generated_at: Optional[datetime] = None,
     probes: Optional[dict] = None,
+    evil_twins: Optional[Dict[str, List[str]]] = None,
+    gps_locations: Optional[Sequence[dict]] = None,
 ) -> str:
     generated_at = generated_at or datetime.now(timezone.utc)
     clients_by_ap: defaultdict = defaultdict(int)
@@ -55,6 +57,9 @@ def build_html_report(
         if bssid:
             clients_by_ap[bssid] += 1
     pmkid_aps = {h.get("bssid") for h in handshakes if h.get("kind") == "pmkid"}
+    essid_by_bssid = {
+        ap.get("bssid"): ap.get("essid") for ap in access_points if ap.get("bssid")
+    }
 
     parts = [
         "<!doctype html><html lang='ru'><head><meta charset='utf-8'>",
@@ -69,6 +74,7 @@ def build_html_report(
         "</div>",
         "<h2>Точки доступа</h2>",
         "<table><tr><th>BSSID</th><th>ESSID</th><th>Производитель</th><th>Канал</th>"
+        "<th>Полоса</th><th>Wi-Fi</th>"
         "<th>Шифрование</th><th>WPS</th><th>MFP</th><th>Сигнал</th><th>Клиенты</th>"
         "<th>Оценка</th><th>Рекомендация</th></tr>",
     ]
@@ -93,6 +99,8 @@ def build_html_report(
             f"<td>{_cell(ap.get('essid'))}</td>"
             f"<td>{_cell(lookup_vendor(ap.get('bssid')))}</td>"
             f"<td>{_cell(ap.get('channel'))}</td>"
+            f"<td>{_cell(ap.get('bandwidth'))}</td>"
+            f"<td>{_cell(ap.get('wifi_generation'))}</td>"
             f"<td>{_cell(ap.get('encryption'))}</td>"
             f"<td>{'да' if ap.get('wps') else ''}</td>"
             f"<td>{'да' if ap.get('mfp_required') else ''}</td>"
@@ -135,6 +143,22 @@ def build_html_report(
             )
         parts.append("</table>")
 
+    if evil_twins:
+        parts.append("<h2>Evil Twin (дубли ESSID)</h2>")
+        parts.append(
+            "<div class='meta'>Один ESSID на нескольких BSSID. Легитимный роуминг "
+            "выглядит так же — проверяйте вручную.</div>"
+        )
+        parts.append("<table><tr><th>ESSID</th><th>BSSID</th></tr>")
+        for essid, bssids in sorted(evil_twins.items()):
+            parts.append(
+                "<tr>"
+                f"<td class='v-high'>{_cell(essid)}</td>"
+                f"<td>{_cell(', '.join(bssids))}</td>"
+                "</tr>"
+            )
+        parts.append("</table>")
+
     parts.append("<h2>Захваты</h2>")
     parts.append(
         "<table><tr><th>Тип</th><th>Качество</th><th>BSSID</th><th>Клиент</th>"
@@ -152,6 +176,28 @@ def build_html_report(
             "</tr>"
         )
     parts.append("</table>")
+
+    if gps_locations:
+        parts.append("<h2>GPS</h2>")
+        parts.append(
+            "<table><tr><th>BSSID</th><th>ESSID</th><th>Широта</th><th>Долгота</th>"
+            "<th>Сигнал</th></tr>"
+        )
+        for loc in gps_locations:
+            bssid = loc.get("bssid")
+            essid = loc.get("essid")
+            if essid is None:
+                essid = essid_by_bssid.get(bssid)
+            parts.append(
+                "<tr>"
+                f"<td>{_cell(bssid)}</td>"
+                f"<td>{_cell(essid)}</td>"
+                f"<td>{_cell(loc.get('latitude'))}</td>"
+                f"<td>{_cell(loc.get('longitude'))}</td>"
+                f"<td>{_cell(loc.get('signal'))}</td>"
+                "</tr>"
+            )
+        parts.append("</table>")
 
     parts.append(
         "<div class='note'>Отчёт предназначен для авторизованного тестирования. "

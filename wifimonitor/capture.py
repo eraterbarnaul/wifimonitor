@@ -1,3 +1,4 @@
+import queue
 import subprocess
 import threading
 import time
@@ -21,11 +22,29 @@ from scapy.all import (  # type: ignore
 )
 from scapy.packet import Packet  # type: ignore
 
-from .detect import DeauthFloodDetector
+from .detect import DeauthFloodDetector, EvilTwinDetector
 from .hashcat import capture_quality, find_pmkid, parse_key_frame
 from .models import AccessPoint, Handshake, Station
 from .timeutil import utcnow
-from .wifi_ie import WPA_VENDOR_HEADER, WPS_VENDOR_HEADER, frequency_to_channel, parse_rsn
+from .wifi_ie import (
+    WPA_VENDOR_HEADER,
+    WPS_VENDOR_HEADER,
+    frequency_to_channel,
+    parse_rsn,
+    IE_HT_CAPABILITIES,
+    IE_VHT_CAPABILITIES,
+    IE_VHT_OPERATION,
+    IE_EXTENSION,
+    IE_EXT_HE_CAPABILITIES,
+    IE_EXT_EHT_CAPABILITIES,
+    parse_ht_capabilities,
+    parse_vht_capabilities,
+    parse_vht_operation,
+    parse_he_capabilities,
+    parse_eht_capabilities,
+    detect_wifi_generation,
+    detect_bandwidth,
+)
 
 DEFAULT_CHANNELS_24GHZ = list(range(1, 14))
 DEFAULT_CHANNELS_5GHZ = [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165]
@@ -45,6 +64,76 @@ def set_interface_channel(interface: str, channel: int) -> bool:
         if result.returncode == 0:
             return True
     return False
+
+
+class _PcapWriter:
+    """Async pcap writer using a background daemon thread and a queue.
+
+    Avoids blocking the sniff thread when writing capture files to disk.
+    Supports both legacy pcap and pcap-ng formats.
+    """
+
+    _SENTINEL = None  # Poison pill to signal shutdown
+
+    def __init__(self, use_pcapng: bool = True) -> None:
+        self._use_pcapng = use_pcapng
+        self._queue: queue.Queue[Optional[Tuple[str, List[Packet]]]] = queue.Queue()
+        self._thread = threading.Thread(target=self._writer_loop, daemon=True, name="pcap-writer")
+        self._thread.start()
+
+    def write(self, path: Path, packets: List[Packet]) -> None:
+        """Enqueue a pcap write request (non-blocking)."""
+        self._queue.put((str(path), packets))
+
+    def stop(self, timeout: float = 5.0) -> None:
+        """Drain remaining writes and stop the writer thread."""
+        self._queue.put(self._SENTINEL)
+        self._thread.join(timeout=timeout)
+
+    def _writer_loop(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is self._SENTINEL:
+                # Drain any remaining items before exiting
+                while not self._queue.empty():
+                    remaining = self._queue.get_nowait()
+                    if remaining is not None:
+                        self._do_write(remaining[0], remaining[1])
+                break
+            self._do_write(item[0], item[1])
+
+    def _do_write(self, path: str, packets: List[Packet]) -> None:
+        try:
+            if self._use_pcapng:
+                self._write_pcapng(path, packets)
+            else:
+                wrpcap(path, packets)
+        except Exception:  # noqa: BLE001 - don't crash writer thread on I/O errors
+            # Fallback to legacy pcap if pcapng fails
+            try:
+                wrpcap(path, packets)
+            except Exception:  # noqa: BLE001
+                pass
+
+    @staticmethod
+    def _write_pcapng(path: str, packets: List[Packet]) -> None:
+        """Write packets in PCAP-NG format with interface and comment metadata.
+
+        Uses scapy's PcapNgWriter when available, falls back to wrpcap.
+        """
+        try:
+            from scapy.utils import PcapNgWriter  # type: ignore
+            with PcapNgWriter(path) as writer:
+                for pkt in packets:
+                    writer.write(pkt)
+        except (ImportError, AttributeError):
+            # Scapy version doesn't support PcapNgWriter context manager,
+            # use raw wrpcap with nano=True for higher timestamp precision
+            try:
+                wrpcap(path, packets, nano=True)
+            except TypeError:
+                # Older scapy without nano parameter
+                wrpcap(path, packets)
 
 
 class ChannelHopper:
@@ -124,6 +213,7 @@ class MonitorService:
         self.on_probe = on_probe
         self.on_ssid_reveal = on_ssid_reveal
         self._deauth_detector = DeauthFloodDetector()
+        self._evil_twin_detector = EvilTwinDetector()
         self._thread: Optional[threading.Thread] = None
         self._running = threading.Event()
         self.capture_dir.mkdir(parents=True, exist_ok=True)
@@ -138,6 +228,7 @@ class MonitorService:
         self._seen_pmkids: Set[Tuple[str, str]] = set()
         self._locked_channel: Optional[int] = None
         self._last_beacon: Dict[str, Packet] = {}
+        self._pcap_writer = _PcapWriter(use_pcapng=True)
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -160,10 +251,11 @@ class MonitorService:
     def stop(self) -> None:
         self._running.clear()
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2)
+            self._thread.join(timeout=5)
         if self._channel_hopper:
             self._channel_hopper.stop()
             self._channel_hopper = None
+        self._pcap_writer.stop(timeout=5.0)
         if self._log:
             self._log("Пассивное сканирование остановлено")
 
@@ -190,7 +282,9 @@ class MonitorService:
                 if self._log and ap.bssid not in self._seen_access_points:
                     self._seen_access_points.add(ap.bssid)
                     essid = ap.essid or "<hidden>"
-                    self._log(f"Обнаружена точка доступа {essid} ({ap.bssid}) канал {ap.channel}")
+                    gen_label = f" Wi-Fi {ap.wifi_generation}" if ap.wifi_generation else ""
+                    bw_label = f" {ap.bandwidth}MHz" if ap.bandwidth else ""
+                    self._log(f"Обнаружена точка доступа {essid} ({ap.bssid}) канал {ap.channel}{gen_label}{bw_label}")
                 if bssid:
                     try:
                         self._last_beacon[bssid] = packet.copy()
@@ -259,6 +353,15 @@ class MonitorService:
         wps = False
         mfp_required = False
         signal = getattr(packet, "dBm_AntSignal", None)
+
+        # Capability tracking for VHT/HE/EHT IE parsing
+        has_ht = False
+        ht_40mhz = False
+        has_vht = False
+        vht_bandwidth = ""
+        has_he = False
+        has_eht = False
+
         elt = packet.getlayer(Dot11Elt)
         while elt is not None:
             if elt.ID == 0:
@@ -267,6 +370,26 @@ class MonitorService:
                 channel = elt.info[0]
             elif elt.ID == 61 and elt.info:
                 ht_channel = elt.info[0]  # HT Operation: primary channel (5 GHz)
+            elif elt.ID == IE_HT_CAPABILITIES and elt.info:
+                ht_caps = parse_ht_capabilities(bytes(elt.info))
+                has_ht = True
+                ht_40mhz = bool(ht_caps.get("ht_40mhz", False))
+            elif elt.ID == IE_VHT_CAPABILITIES and elt.info:
+                vht_caps = parse_vht_capabilities(bytes(elt.info))
+                has_vht = True
+            elif elt.ID == IE_VHT_OPERATION and elt.info:
+                vht_op = parse_vht_operation(bytes(elt.info))
+                has_vht = True
+                vht_bandwidth = str(vht_op.get("vht_op_bandwidth", ""))
+            elif elt.ID == IE_EXTENSION and elt.info and len(elt.info) >= 1:
+                ext_id = elt.info[0]
+                ext_body = bytes(elt.info[1:])
+                if ext_id == IE_EXT_HE_CAPABILITIES:
+                    parse_he_capabilities(ext_body)
+                    has_he = True
+                elif ext_id == IE_EXT_EHT_CAPABILITIES:
+                    parse_eht_capabilities(ext_body)
+                    has_eht = True
             elif elt.ID == 48:
                 rsn = parse_rsn(bytes(elt.info))
                 encryption.append(str(rsn["classification"]))
@@ -278,12 +401,31 @@ class MonitorService:
                 elif header == WPS_VENDOR_HEADER:
                     wps = True
             elt = elt.payload.getlayer(Dot11Elt)
+
         # DS Parameter Set (IE 3) is usually absent on 5/6 GHz; fall back to the
         # HT Operation primary channel and finally the RadioTap frequency.
         if not channel:
             channel = ht_channel
         if not channel:
             channel = frequency_to_channel(getattr(packet, "ChannelFrequency", None))
+
+        # Determine Wi-Fi generation and bandwidth from parsed IEs
+        wifi_generation = detect_wifi_generation(
+            has_ht=has_ht,
+            has_vht=has_vht,
+            has_he=has_he,
+            has_eht=has_eht,
+            channel=channel,
+        )
+        bandwidth = detect_bandwidth(
+            has_ht=has_ht,
+            ht_40mhz=ht_40mhz,
+            has_vht=has_vht,
+            vht_bandwidth=vht_bandwidth,
+            has_he=has_he,
+            has_eht=has_eht,
+        )
+
         ordered: List[str] = []
         for token in encryption:
             for part in token.split("/"):
@@ -296,10 +438,24 @@ class MonitorService:
             encryption="/".join(ordered) if ordered else None,
             wps=wps,
             mfp_required=mfp_required,
+            bandwidth=bandwidth,
+            wifi_generation=wifi_generation,
             last_seen=utcnow(),
         )
         if signal is not None:
             ap.signal = int(signal)
+
+        # Real-time evil twin detection
+        evil_twin_alert = self._evil_twin_detector.check(
+            bssid=bssid,
+            essid=essid,
+            channel=channel,
+            encryption="/".join(ordered) if ordered else None,
+            timestamp=time.time(),
+        )
+        if evil_twin_alert and self.on_alert:
+            self.on_alert(evil_twin_alert)
+
         return ap
 
     def _process_handshake(self, packet, bssid: Optional[str]) -> None:
@@ -466,5 +622,5 @@ class MonitorService:
             except AttributeError:
                 to_dump.append(beacon)
         to_dump.extend(packets)
-        wrpcap(str(path), to_dump)
+        self._pcap_writer.write(path, to_dump)
         return path

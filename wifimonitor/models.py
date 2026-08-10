@@ -14,6 +14,8 @@ class AccessPoint:
     signal: Optional[int] = None
     wps: bool = False
     mfp_required: bool = False
+    bandwidth: str = ""  # "20", "40", "80", "160" MHz
+    wifi_generation: str = ""  # "4" (n), "5" (ac), "6" (ax), "6E", "7" (be)
     last_seen: datetime = field(default_factory=utcnow)
 
 
@@ -33,3 +35,13 @@ class Handshake:
     kind: str = "handshake"  # "handshake" (4-way EAPOL) or "pmkid"
     quality: str = ""  # crackable / partial / ...
     created_at: datetime = field(default_factory=utcnow)
+
+
+@dataclass
+class GpsCoordinate:
+    """GPS position for wardriving integration."""
+    latitude: float
+    longitude: float
+    altitude: Optional[float] = None
+    accuracy: Optional[float] = None
+    timestamp: datetime = field(default_factory=utcnow)

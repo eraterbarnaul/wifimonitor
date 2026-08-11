@@ -270,11 +270,30 @@ class MonitorService:
     def _should_stop(self, _) -> bool:
         return not self._running.is_set()
 
+    @staticmethod
+    def _frame_bssid(dot11) -> Optional[str]:
+        """The BSSID address for this frame, honoring ToDS/FromDS addressing.
+
+        ``addr3`` is only reliably the BSSID for management frames and for
+        ad-hoc (ToDS=FromDS=0) traffic. For ordinary infrastructure data
+        frames it can instead be the frame's real source/destination beyond
+        the AP — e.g. a station's uplink frame (ToDS=1) carries its BSSID in
+        ``addr1``, not ``addr3``. EAPOL exchanges terminate at the AP itself
+        in both directions, so they resolve to the same value either way.
+        """
+        to_ds = bool(dot11.FCfield.to_DS)
+        from_ds = bool(dot11.FCfield.from_DS)
+        if to_ds and not from_ds:
+            return dot11.addr1
+        if from_ds and not to_ds:
+            return dot11.addr2
+        return dot11.addr3
+
     def _handle_packet(self, packet) -> None:
         if not packet.haslayer(Dot11):
             return
         dot11 = packet[Dot11]
-        bssid = dot11.addr3
+        bssid = self._frame_bssid(dot11)
         if packet.haslayer(Dot11Beacon) or packet.haslayer(Dot11ProbeResp):
             ap = self._parse_access_point(packet, bssid)
             if ap and self.on_access_point:

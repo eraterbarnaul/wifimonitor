@@ -159,9 +159,10 @@ class MonitorUseCase:
     def _handle_handshake(self, handshake: Handshake) -> None:
         self.db.add_handshake(handshake)
         self.bus.emit(Events.HANDSHAKE_CAPTURED, asdict(handshake))
-        # Notify auto-attack pipeline if running
+        # Notify auto-attack pipeline if running (it ignores handshakes for a
+        # different BSSID than the one it's currently targeting)
         if self.auto_attack and self.auto_attack.is_running():
-            self.auto_attack.notify_handshake(handshake.capture_path)
+            self.auto_attack.notify_handshake(handshake.capture_path, handshake.bssid)
 
     def _handle_alert(self, message: str) -> None:
         if self.deauth_service and self.deauth_service.is_running():

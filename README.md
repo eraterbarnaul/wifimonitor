@@ -36,17 +36,6 @@
 - REST API + веб‑интерфейс для удалённого управления (headless/Raspberry Pi);
 - headless CLI для автономных обходов; система плагинов атак; шина событий и слой use‑cases, общие для GUI/CLI/API.
 
-## Архитектура
-Логика отделена от Qt: слой `usecases.py` используют и GUI‑контроллер, и CLI, и REST API.
-
-| Слой | Модули |
-|---|---|
-| Сбор/радио | `capture.py`, `deauth.py`, `pmkid_request.py`, `interface.py` |
-| Разбор/анализ | `wifi_ie.py`, `audit.py`, `oui.py`, `detect.py`, `hashcat.py` |
-| Атаки | `wps_attack.py`, `crack.py`, `auto_attack.py`, `plugins.py` |
-| Данные/экспорт | `database.py` (SQLite WAL), `models.py`, `exporters.py`, `csv_export.py`, `report.py` |
-| Приложение | `usecases.py`, `controller.py` (Qt), `events.py`, `gps.py`, `rest_api.py`, `cli.py`, `app.py`, `ui/` |
-
 ## Установка
 ```bash
 sudo apt update
@@ -58,8 +47,6 @@ source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
-Для полностью воспроизводимой среды разработки (точные версии, на которых прошёл весь набор
-тестов) используйте `pip install -r requirements-lock.txt` вместо `requirements.txt`.
 
 Или готовый пакет:
 ```bash
@@ -125,7 +112,6 @@ sudo ./.venv/bin/python -m wifimonitor.cli -i wlan0 --api --api-host 0.0.0.0 --a
 bash packaging/build_deb.sh 2.0.0   # -> dist/wifimonitor_2.0.0_all.deb
 bash packaging/build_run.sh 2.0.0   # -> dist/wifimonitor_2.0.0.run
 ```
-CI (`.github/workflows/ci.yml`) гоняет тесты на Python 3.10–3.12, `ruff` и `mypy`. Релиз собирается автоматически по пушу тега `v*` (`release.yml`): sdist + wheel + `.deb` + `.run` публикуются в GitHub Release.
 
 ## Диагностика
 - Нет интерфейса в списке — проверьте адаптеры: `iw dev`.

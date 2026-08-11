@@ -1,6 +1,6 @@
 """Tests for REST API token checking."""
 
-from wifimonitor.auth import check_token, generate_token, resolve_token
+from wifimonitor.auth import RateLimiter, check_token, generate_token, resolve_token
 
 
 def test_no_token_means_open():
@@ -48,3 +48,33 @@ def test_resolve_token_file_wins_over_arg(tmp_path):
 
 def test_resolve_token_neither_set_is_empty():
     assert resolve_token("", "") == ""
+
+
+def test_rate_limiter_blocks_after_max_failures():
+    limiter = RateLimiter(max_failures=3, window_seconds=60.0)
+    for _ in range(3):
+        assert limiter.is_blocked("1.2.3.4") is False
+        limiter.record_failure("1.2.3.4")
+    assert limiter.is_blocked("1.2.3.4") is True
+
+
+def test_rate_limiter_keys_are_independent():
+    limiter = RateLimiter(max_failures=1, window_seconds=60.0)
+    limiter.record_failure("1.2.3.4")
+    assert limiter.is_blocked("1.2.3.4") is True
+    assert limiter.is_blocked("5.6.7.8") is False
+
+
+def test_rate_limiter_success_clears_failures():
+    limiter = RateLimiter(max_failures=1, window_seconds=60.0)
+    limiter.record_failure("1.2.3.4")
+    assert limiter.is_blocked("1.2.3.4") is True
+    limiter.record_success("1.2.3.4")
+    assert limiter.is_blocked("1.2.3.4") is False
+
+
+def test_rate_limiter_window_expires():
+    limiter = RateLimiter(max_failures=1, window_seconds=10.0)
+    limiter.record_failure("1.2.3.4", now=0.0)
+    assert limiter.is_blocked("1.2.3.4", now=5.0) is True
+    assert limiter.is_blocked("1.2.3.4", now=15.0) is False  # outside the window

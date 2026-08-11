@@ -1,0 +1,27 @@
+# Exact versions known to install and pass the full test suite together
+# (generated 2026-08-11, Python 3.11). Regenerate with:
+#   pip install -e ".[dev]" && pip freeze | grep -v '^wifimonitor'
+# Use `pip install -r requirements.txt` (or the [dev] extra) for normal installs —
+# this file is only for a fully reproducible dev/CI environment.
+
+# Runtime
+scapy==2.7.0
+PyQt5==5.15.11
+PyQt5-Qt5==5.15.19
+PyQt5_sip==12.19.0
+openpyxl==3.1.5
+et_xmlfile==2.0.0
+
+# Dev
+pytest==8.4.2
+iniconfig==2.3.0
+pluggy==1.6.0
+Pygments==2.20.0
+ruff==0.16.2
+mypy==1.20.2
+mypy_extensions==1.1.0
+librt==0.15.0
+pathspec==1.1.1
+typing_extensions==4.16.0
+PyQt5-stubs==5.15.6.0
+packaging==26.3

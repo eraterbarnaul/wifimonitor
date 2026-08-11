@@ -50,6 +50,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Added `--api-token-file` to read the bearer token from a file instead of a
   command-line argument, which is otherwise visible to other local users via
   `ps`/`/proc/<pid>/cmdline`.
+- The REST API now rate-limits failed token attempts per client IP (10
+  failures / 60s by default, `429` while locked out) to make brute-forcing a
+  token over the network impractical.
+
+### Added
+- `PyQt5-stubs` in the `dev` extra so `mypy` actually type-checks
+  `ui/main_window.py` instead of treating every `PyQt5` symbol as `Any`;
+  fixed the ~50 Qt-enum errors it then found (same runtime values, just
+  accessed the way the stubs expect — no behavior change).
+- A GUI smoke test (`tests/test_main_window_smoke.py`) that constructs and
+  closes `MainWindow` under `QT_QPA_PLATFORM=offscreen`, catching
+  import-time/constructor crashes the mocked controller/capture tests can't
+  reach. CI's `test` job now sets `QT_QPA_PLATFORM=offscreen`.
+- `requirements-lock.txt`: exact dependency versions verified to install
+  cleanly and pass the full test suite, mypy, and ruff together, for a fully
+  reproducible dev setup.
+- `LICENSE` (MIT, matching `pyproject.toml`'s declared license — previously
+  missing), `SECURITY.md`, `CONTRIBUTING.md`, and `.github/dependabot.yml`.
+
+This round was verified against the real dependencies (`scapy`, `PyQt5`,
+`openpyxl`) in an installed environment, not just the pure-logic subset:
+214 tests pass, `mypy` and `ruff` are clean, and `MainWindow` boots under
+`QT_QPA_PLATFORM=offscreen`.
 
 ## [2.0.0]
 

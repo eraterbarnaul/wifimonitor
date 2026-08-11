@@ -8,7 +8,11 @@ from __future__ import annotations
 
 import hmac
 import secrets
+import threading
+import time
+from collections import defaultdict
 from pathlib import Path
+from typing import Dict, List, Optional
 
 
 def generate_token(nbytes: int = 24) -> str:
@@ -43,3 +47,38 @@ def check_token(expected: str, authorization_header: str = "", query_token: str 
     if not provided and query_token:
         provided = query_token
     return bool(provided) and hmac.compare_digest(provided, expected)
+
+
+class RateLimiter:
+    """Fixed-window per-key lockout to slow naive brute-forcing of the API token.
+
+    Single-process, in-memory bookkeeping — enough to make guessing a token over
+    the network impractical for a local admin tool; not a substitute for a real
+    token in the first place.
+    """
+
+    def __init__(self, max_failures: int = 10, window_seconds: float = 60.0) -> None:
+        self.max_failures = max_failures
+        self.window_seconds = window_seconds
+        self._lock = threading.Lock()
+        self._failures: Dict[str, List[float]] = defaultdict(list)
+
+    def _prune(self, key: str, now: float) -> List[float]:
+        attempts = [t for t in self._failures.get(key, []) if now - t < self.window_seconds]
+        self._failures[key] = attempts
+        return attempts
+
+    def is_blocked(self, key: str, now: Optional[float] = None) -> bool:
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            return len(self._prune(key, now)) >= self.max_failures
+
+    def record_failure(self, key: str, now: Optional[float] = None) -> None:
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            self._prune(key, now)
+            self._failures[key].append(now)
+
+    def record_success(self, key: str) -> None:
+        with self._lock:
+            self._failures.pop(key, None)

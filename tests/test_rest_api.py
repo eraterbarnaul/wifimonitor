@@ -148,6 +148,29 @@ def test_api_accepts_query_token_fallback(api_server_with_token):
     assert "monitoring" in data
 
 
+def test_api_locks_out_after_repeated_failures(api_server_with_token):
+    """After enough wrong-token attempts from one client, further requests get 429
+
+    even before the token is checked again — RateLimiter's default is 10 failures
+    per 60s window (see auth.RateLimiter / ApiHandler.rate_limiter).
+    """
+    req = urllib.request.Request(
+        "http://127.0.0.1:18933/api/status", headers={"Authorization": "Bearer wrong"}
+    )
+    for _ in range(10):
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req, timeout=5)
+        assert exc.value.code == 401
+
+    # 11th attempt (even with the correct token) is locked out, not just unauthorized
+    correct_req = urllib.request.Request(
+        "http://127.0.0.1:18933/api/status", headers={"Authorization": "Bearer s3cr3t"}
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(correct_req, timeout=5)
+    assert exc.value.code == 429
+
+
 def test_post_oversized_body_rejected(api_server):
     """A client claiming a huge Content-Length must be refused, not buffered."""
     import http.client

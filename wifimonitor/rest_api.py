@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlparse
 
-from .auth import check_token
+from .auth import RateLimiter, check_token
 from .plugins import registry
 from .usecases import MonitorUseCase
 
@@ -32,14 +32,23 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     use_case: Optional[MonitorUseCase] = None
     auth_token: str = ""  # when set, requests must present it
+    rate_limiter: RateLimiter = RateLimiter()
 
     def log_message(self, format, *args):
         pass  # Suppress default logging
 
     def _authorized(self) -> bool:
+        client_ip = self.client_address[0]
+        if self.auth_token and self.rate_limiter.is_blocked(client_ip):
+            self._error(429, "Too many failed attempts — try again later")
+            return False
         query_token = (parse_qs(urlparse(self.path).query).get("token") or [""])[0]
         if check_token(self.auth_token, self.headers.get("Authorization", ""), query_token):
+            if self.auth_token:
+                self.rate_limiter.record_success(client_ip)
             return True
+        if self.auth_token:
+            self.rate_limiter.record_failure(client_ip)
         self._error(401, "Unauthorized")
         return False
 
@@ -207,6 +216,7 @@ class RestApiServer:
     def start(self) -> None:
         ApiHandler.use_case = self._uc
         ApiHandler.auth_token = self._token
+        ApiHandler.rate_limiter = RateLimiter()  # fresh lockout state for this server instance
         if self._host not in ("127.0.0.1", "localhost", "::1") and not self._token:
             logging.getLogger("wifimonitor").warning(
                 "REST API слушает %s без токена — доступ к управлению и данным открыт всем в сети",

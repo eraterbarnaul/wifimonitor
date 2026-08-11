@@ -1,5 +1,18 @@
 # Contributing
 
+## Architecture
+
+Logic is kept out of Qt: the `usecases.py` layer is shared by the GUI controller, the CLI,
+and the REST API.
+
+| Layer | Modules |
+|---|---|
+| Capture/radio | `capture.py`, `deauth.py`, `pmkid_request.py`, `interface.py` |
+| Parsing/analysis | `wifi_ie.py`, `audit.py`, `oui.py`, `detect.py`, `hashcat.py` |
+| Attacks | `wps_attack.py`, `crack.py`, `auto_attack.py`, `plugins.py` |
+| Data/export | `database.py` (SQLite WAL), `models.py`, `exporters.py`, `csv_export.py`, `report.py` |
+| App | `usecases.py`, `controller.py` (Qt), `events.py`, `gps.py`, `rest_api.py`, `cli.py`, `app.py`, `ui/` |
+
 ## Setup
 
 ```bash
@@ -10,6 +23,9 @@ pip install -e ".[dev]"
 
 This installs the runtime dependencies (`scapy`, `PyQt5`, `openpyxl`) plus the
 dev tools (`pytest`, `ruff`, `mypy`, `PyQt5-stubs`).
+
+For a fully reproducible environment (exact versions the full test suite is known to pass
+with), use `pip install -r requirements-lock.txt` instead.
 
 ## Before opening a PR
 

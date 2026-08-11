@@ -81,3 +81,72 @@ def test_evil_twin_detector_created(monitor_service):
     svc, _, _ = monitor_service
     from wifimonitor.detect import EvilTwinDetector
     assert isinstance(svc._evil_twin_detector, EvilTwinDetector)
+
+
+# --- _frame_bssid: addr3 is only reliably the BSSID for management frames;
+# ordinary ToDS/FromDS data traffic needs the right address slot instead. ---
+#
+# NB: Dot11()'s default FCfield is a shared object across instances that
+# don't override it — mutating `pkt.FCfield.to_DS = 1` in place leaks into
+# every other Dot11() built afterwards without an explicit FCfield. Pass the
+# flag bits at construction time instead (bit 0 = to_DS, bit 1 = from_DS) so
+# each packet's addressing mode is actually isolated.
+_TO_DS = 1
+_FROM_DS = 2
+
+BSSID = "aa:aa:aa:aa:aa:aa"
+STATION = "bb:bb:bb:bb:bb:bb"
+FAR_SIDE = "cc:cc:cc:cc:cc:cc"  # e.g. a router/host beyond the AP - not the BSSID
+
+
+def test_frame_bssid_management_frame_uses_addr3():
+    from scapy.all import Dot11
+    from wifimonitor.capture import MonitorService
+
+    pkt = Dot11(type=0, subtype=8, FCfield=0, addr1="ff:ff:ff:ff:ff:ff", addr2=BSSID, addr3=BSSID)
+    assert MonitorService._frame_bssid(pkt) == BSSID
+
+
+def test_frame_bssid_station_uplink_uses_addr1_not_addr3():
+    """ToDS=1 (station -> AP): addr3 is the frame's real destination beyond
+
+    the AP, not the BSSID. The BSSID is addr1.
+    """
+    from scapy.all import Dot11
+    from wifimonitor.capture import MonitorService
+
+    pkt = Dot11(type=2, subtype=0, FCfield=_TO_DS, addr1=BSSID, addr2=STATION, addr3=FAR_SIDE)
+    assert MonitorService._frame_bssid(pkt) == BSSID
+    assert MonitorService._frame_bssid(pkt) != pkt.addr3
+
+
+def test_frame_bssid_ap_downlink_uses_addr2_not_addr3():
+    """FromDS=1 (AP -> station): addr3 is the frame's original source beyond
+
+    the AP, not the BSSID. The BSSID is addr2.
+    """
+    from scapy.all import Dot11
+    from wifimonitor.capture import MonitorService
+
+    pkt = Dot11(type=2, subtype=0, FCfield=_FROM_DS, addr1=STATION, addr2=BSSID, addr3=FAR_SIDE)
+    assert MonitorService._frame_bssid(pkt) == BSSID
+    assert MonitorService._frame_bssid(pkt) != pkt.addr3
+
+
+def test_handle_packet_data_frame_station_gets_correct_bssid(monitor_service):
+    """Regression test for the addr3 misattribution bug: a station seen only
+
+    via an ordinary (non-EAPOL) uplink data frame must be recorded with the
+    real BSSID, not the frame's far-side destination address.
+    """
+    from scapy.all import Dot11
+    svc, _, _ = monitor_service
+    seen = []
+    svc.on_station = lambda station: seen.append(station)
+
+    pkt = Dot11(type=2, subtype=0, FCfield=_TO_DS, addr1=BSSID, addr2=STATION, addr3=FAR_SIDE)
+    svc._handle_packet(pkt)
+
+    assert len(seen) == 1
+    assert seen[0].mac == STATION
+    assert seen[0].associated_bssid == BSSID

@@ -64,6 +64,7 @@ class AutoAttackPipeline:
         self._stop_event = threading.Event()
         self._handshake_event = threading.Event()
         self._captured_path: Optional[str] = None
+        self._target_bssid: str = ""
 
     @property
     def phase(self) -> AutoAttackPhase:
@@ -76,6 +77,7 @@ class AutoAttackPipeline:
         self._stop_event.clear()
         self._handshake_event.clear()
         self._captured_path = None
+        self._target_bssid = bssid.lower()
         self._thread = threading.Thread(
             target=self._run,
             args=(bssid, clients, channel, essid),
@@ -92,8 +94,16 @@ class AutoAttackPipeline:
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    def notify_handshake(self, capture_path: str) -> None:
-        """Called externally when a handshake is captured for the target."""
+    def notify_handshake(self, capture_path: str, bssid: str) -> None:
+        """Called externally when a handshake is captured.
+
+        Ignores handshakes for a different BSSID than the one this pipeline is
+        currently targeting — otherwise an unrelated AP's handshake, captured
+        by the passive scanner while this pipeline is running (e.g. sharing
+        the locked channel), would be mistaken for this attack's own result.
+        """
+        if bssid.lower() != self._target_bssid:
+            return
         self._captured_path = capture_path
         self._handshake_event.set()
 

@@ -84,21 +84,26 @@ sudo ./.venv/bin/python -m wifimonitor.cli -i wlan0 \
 
 **REST API + веб‑интерфейс:**
 ```bash
-sudo ./.venv/bin/python -m wifimonitor.cli -i wlan0 --api        # 127.0.0.1:8080
-# наружу (осторожно, без авторизации): --api-host 0.0.0.0 --api-port 8080
+sudo ./.venv/bin/python -m wifimonitor.cli -i wlan0 --api        # 127.0.0.1:8080, без токена
+# наружу, с токеном (обязательно перед 0.0.0.0):
+export WIFIMONITOR_API_TOKEN=$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')
+sudo -E ./.venv/bin/python -m wifimonitor.cli -i wlan0 --api --api-host 0.0.0.0 --api-token "$WIFIMONITOR_API_TOKEN"
+# или через файл, чтобы токен не попадал в `ps`/историю shell:
+sudo ./.venv/bin/python -m wifimonitor.cli -i wlan0 --api --api-host 0.0.0.0 --api-token-file /path/to/token.txt
 ```
-Веб‑интерфейс — на `/`. Эндпоинты:
+Веб‑интерфейс — на `/` (загружается без токена; для запросов к API откройте `/?token=...` один раз — страница сохранит токен в `localStorage` и уберёт его из адресной строки, либо введите его в поле «Токен доступа» внизу страницы). Эндпоинты:
 
 | Метод | Путь | Назначение |
 |---|---|---|
 | GET | `/api/status` | статус захвата |
 | GET | `/api/access_points`, `/api/stations`, `/api/handshakes` | данные |
 | GET | `/api/interfaces`, `/api/sessions` | интерфейсы, сессии |
+| GET | `/api/plugins` | список зарегистрированных плагинов атак |
 | POST | `/api/start`, `/api/stop` | старт/стоп захвата |
 | POST | `/api/deauth`, `/api/deauth/stop` | деаутентификация |
 | POST | `/api/auto_attack`, `/api/auto_attack/stop` | авто‑захват |
 
-> REST API **без аутентификации** и по умолчанию слушает только `127.0.0.1`. Не выставляйте `--api-host 0.0.0.0` в недоверенную сеть — используйте SSH‑туннель или доверенный сегмент.
+Все `/api/*` эндпоинты (кроме самой страницы `/`) требуют токен, если он задан — либо заголовком `Authorization: Bearer <token>`, либо `?token=...` в query. По умолчанию API слушает только `127.0.0.1` и токен не требуется; при `--api-host 0.0.0.0` без токена в лог пишется предупреждение. Не выставляйте API в недоверенную сеть без токена — используйте SSH‑туннель, доверенный сегмент или токен.
 
 ### Рабочий процесс (GUI)
 1. «Мониторинг»: выберите интерфейс, «Применить» → «Старт». Канал‑хоппер собирает точки и клиентов; колонка «Оценка» показывает приоритет атаки.

@@ -23,8 +23,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   teardown, and the UI cleanup paths now log via the `wifimonitor` logger
   instead of swallowing errors.
 - Dependencies now carry upper version bounds (`scapy<3`, `PyQt5<6`,
-  `openpyxl<4`) in `pyproject.toml` and `requirements.txt`; `ruff` is pinned in
-  the `dev` extra.
+  `openpyxl<4`) in `pyproject.toml` and `requirements.txt`; `ruff` and `mypy`
+  are pinned in the `dev` extra.
+- The REST API server now uses `ThreadingHTTPServer` instead of the
+  single-threaded `HTTPServer`, so one slow client can no longer stall every
+  other request.
+- `mypy` runs in CI alongside `ruff`; the 15 pre-existing type errors it found
+  across `hashcat.py`, `detect.py`, `report.py`, `database.py`, `plugins.py`,
+  and `usecases.py` are fixed.
+
+### Fixed
+- The bundled REST API dashboard (`/`) now loads and authenticates correctly
+  when `--api-token` is set: the page itself is served without a token (it
+  carries no data of its own), and its JavaScript now attaches the saved
+  token as an `Authorization: Bearer` header to every API call it makes.
+  Previously, enabling the token — the documented way to expose the API
+  beyond localhost — made the dashboard unusable.
+- Stored XSS in the REST API dashboard: access-point/handshake fields
+  (ESSID, BSSID, station MAC, …) are attacker-controlled over the air and
+  were interpolated into `innerHTML` unescaped. They're now HTML-escaped
+  client-side before rendering.
+
+### Security
+- `POST` bodies are capped at 1 MiB; a client claiming a larger
+  `Content-Length` gets `413` instead of the server buffering it in memory.
+- Added `--api-token-file` to read the bearer token from a file instead of a
+  command-line argument, which is otherwise visible to other local users via
+  `ps`/`/proc/<pid>/cmdline`.
 
 ## [2.0.0]
 

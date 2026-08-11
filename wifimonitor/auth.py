@@ -8,11 +8,24 @@ from __future__ import annotations
 
 import hmac
 import secrets
+from pathlib import Path
 
 
 def generate_token(nbytes: int = 24) -> str:
     """Return a random URL-safe token suitable for the API."""
     return secrets.token_urlsafe(nbytes)
+
+
+def resolve_token(token_arg: str, token_file: str) -> str:
+    """Pick the effective API token, preferring a token file over a bare argument.
+
+    A token passed directly on the command line ends up in ``ps``/``/proc/<pid>/cmdline``
+    and is readable by any local user; a file path is not. ``token_file`` wins when both
+    are set so operators who follow the more secure path aren't silently overridden.
+    """
+    if token_file:
+        return Path(token_file).read_text(encoding="utf-8").strip()
+    return token_arg
 
 
 def check_token(expected: str, authorization_header: str = "", query_token: str = "") -> bool:

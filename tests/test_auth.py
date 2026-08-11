@@ -1,6 +1,6 @@
 """Tests for REST API token checking."""
 
-from wifimonitor.auth import check_token, generate_token
+from wifimonitor.auth import check_token, generate_token, resolve_token
 
 
 def test_no_token_means_open():
@@ -28,3 +28,23 @@ def test_generate_token_is_nonempty_and_unique():
     a = generate_token()
     b = generate_token()
     assert a and b and a != b
+
+
+def test_resolve_token_prefers_arg_when_no_file():
+    assert resolve_token("argtoken", "") == "argtoken"
+
+
+def test_resolve_token_reads_file_and_strips_whitespace(tmp_path):
+    token_file = tmp_path / "token.txt"
+    token_file.write_text("  filetoken\n")
+    assert resolve_token("argtoken", str(token_file)) == "filetoken"
+
+
+def test_resolve_token_file_wins_over_arg(tmp_path):
+    token_file = tmp_path / "token.txt"
+    token_file.write_text("filetoken")
+    assert resolve_token("argtoken", str(token_file)) == "filetoken"
+
+
+def test_resolve_token_neither_set_is_empty():
+    assert resolve_token("", "") == ""

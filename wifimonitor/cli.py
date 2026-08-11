@@ -49,12 +49,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--api-host", default="127.0.0.1",
-        help="REST API bind host (default: 127.0.0.1; use 0.0.0.0 to expose — no auth!)",
+        help="REST API bind host (default: 127.0.0.1; set --api-token before using 0.0.0.0)",
     )
     parser.add_argument("--api-port", type=int, default=8080, help="REST API port (default: 8080)")
     parser.add_argument(
         "--api-token", default=os.environ.get("WIFIMONITOR_API_TOKEN", ""),
-        help="require this bearer token for the REST API (env: WIFIMONITOR_API_TOKEN)",
+        help="require this bearer token for the REST API (env: WIFIMONITOR_API_TOKEN). "
+             "Prefer --api-token-file or the env var over this flag: a value passed "
+             "directly on the command line is visible to other local users via ps/proc.",
+    )
+    parser.add_argument(
+        "--api-token-file", default="",
+        help="read the REST API bearer token from this file instead of an argument/env var",
     )
     return parser
 
@@ -99,14 +105,16 @@ def run(args: argparse.Namespace) -> int:
 
     server = None
     if args.api:
+        from .auth import resolve_token
         from .rest_api import RestApiServer
 
-        server = RestApiServer(uc, host=args.api_host, port=args.api_port, token=args.api_token)
+        token = resolve_token(args.api_token, args.api_token_file)
+        server = RestApiServer(uc, host=args.api_host, port=args.api_port, token=token)
         server.start()
         log.info(
             "REST API on %s (web UI at /) — control capture via the API%s",
             server.url,
-            "" if args.api_token else " [no token: keep it on localhost]",
+            "" if token else " [no token: keep it on localhost]",
         )
     else:
         log.info("headless capture on %s", args.interface)

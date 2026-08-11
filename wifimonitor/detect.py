@@ -79,8 +79,8 @@ class EvilTwinDetector:
         # Check for multiple BSSIDs on one ESSID (new BSSID appearing)
         if len(existing_bssids) > 0 and bssid not in existing_bssids:
             # This BSSID is new for this ESSID
-            last = self._last_alerts.get(essid)
-            if last is None or (timestamp - last > self.cooldown):
+            last_new_bssid = self._last_alerts.get(essid)
+            if last_new_bssid is None or (timestamp - last_new_bssid > self.cooldown):
                 self._alerted.add((essid, bssid))
                 self._last_alerts[essid] = timestamp
                 count = len(self._by_essid[essid])

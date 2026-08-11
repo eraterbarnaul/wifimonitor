@@ -80,6 +80,12 @@ tr:hover td { background: #1c2128; }
     <button class="danger" onclick="apiPost('/api/deauth/stop')">Стоп Deauth</button>
 </div>
 
+<h2>Токен доступа</h2>
+<div class="input-row">
+    <input id="api-token" placeholder="Bearer-токен API (если включён)" type="password">
+    <button onclick="saveToken()">Сохранить</button>
+</div>
+
 <h2>Лог</h2>
 <div class="log" id="log"></div>
 
@@ -87,9 +93,43 @@ tr:hover td { background: #1c2128; }
 const BASE = window.location.origin;
 let refreshInterval;
 
+// Token comes from (in order): saved localStorage value, then a one-time
+// "?token=" query param on the page URL (used only to seed localStorage —
+// the URL itself is stripped immediately so it doesn't linger in history).
+function loadToken() {
+    const fromUrl = new URLSearchParams(window.location.search).get('token');
+    if (fromUrl) {
+        localStorage.setItem('wifimonitor_api_token', fromUrl);
+        const url = new URL(window.location.href);
+        url.searchParams.delete('token');
+        window.history.replaceState({}, '', url);
+    }
+    return localStorage.getItem('wifimonitor_api_token') || '';
+}
+
+function saveToken() {
+    localStorage.setItem('wifimonitor_api_token', document.getElementById('api-token').value.trim());
+    log('Токен сохранён');
+    refresh();
+}
+
+function authHeaders(extra = {}) {
+    const token = loadToken();
+    return token ? { ...extra, 'Authorization': 'Bearer ' + token } : extra;
+}
+
+// Escape untrusted text (SSIDs, MACs, etc. come straight from over-the-air
+// capture and are attacker-controlled) before it ever reaches innerHTML.
+function esc(value) {
+    const div = document.createElement('div');
+    div.textContent = value === undefined || value === null ? '' : String(value);
+    return div.innerHTML;
+}
+
 async function apiGet(path) {
     try {
-        const r = await fetch(BASE + path);
+        const r = await fetch(BASE + path, { headers: authHeaders() });
+        if (r.status === 401) { log('Требуется токен API — введите его ниже и сохраните'); return null; }
         return await r.json();
     } catch (e) {
         log('Ошибка: ' + e.message);
@@ -101,9 +141,10 @@ async function apiPost(path, body = {}) {
     try {
         const r = await fetch(BASE + path, {
             method: 'POST',
-            headers: {'Content-Type': 'application/json'},
+            headers: authHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify(body)
         });
+        if (r.status === 401) { log('Требуется токен API — введите его ниже и сохраните'); return null; }
         const data = await r.json();
         log(JSON.stringify(data));
         refresh();
@@ -115,15 +156,15 @@ async function apiPost(path, body = {}) {
 
 function encBadge(enc) {
     if (!enc) return '<span class="badge badge-open">OPEN</span>';
-    if (enc.includes('WPA3')) return `<span class="badge badge-wpa3">${enc}</span>`;
-    return `<span class="badge badge-wpa2">${enc}</span>`;
+    if (enc.includes('WPA3')) return `<span class="badge badge-wpa3">${esc(enc)}</span>`;
+    return `<span class="badge badge-wpa2">${esc(enc)}</span>`;
 }
 
 function wifiBadge(gen) {
     if (!gen) return '';
     if (gen === '7') return '<span class="badge badge-wifi7">Wi-Fi 7</span>';
-    if (gen === '6' || gen === '6E') return `<span class="badge badge-wifi6">Wi-Fi ${gen}</span>`;
-    return `Wi-Fi ${gen}`;
+    if (gen === '6' || gen === '6E') return `<span class="badge badge-wifi6">Wi-Fi ${esc(gen)}</span>`;
+    return `Wi-Fi ${esc(gen)}`;
 }
 
 async function refresh() {
@@ -145,13 +186,13 @@ async function refresh() {
     if (aps) {
         const tbody = document.querySelector('#ap-table tbody');
         tbody.innerHTML = aps.map(ap => `<tr>
-            <td>${ap.bssid || ''}</td>
-            <td>${ap.essid || '<hidden>'}</td>
-            <td>${ap.channel || ''}</td>
-            <td>${ap.bandwidth ? ap.bandwidth + ' МГц' : ''}</td>
+            <td>${esc(ap.bssid)}</td>
+            <td>${ap.essid ? esc(ap.essid) : '&lt;hidden&gt;'}</td>
+            <td>${esc(ap.channel)}</td>
+            <td>${ap.bandwidth ? esc(ap.bandwidth) + ' МГц' : ''}</td>
             <td>${wifiBadge(ap.wifi_generation)}</td>
             <td>${encBadge(ap.encryption)}</td>
-            <td>${ap.signal || ''} dBm</td>
+            <td>${esc(ap.signal)} dBm</td>
             <td>${ap.wps ? 'да' : ''}</td>
         </tr>`).join('');
     }
@@ -166,11 +207,11 @@ async function refresh() {
         document.getElementById('hs-count').textContent = hs.length;
         const tbody = document.querySelector('#hs-table tbody');
         tbody.innerHTML = hs.slice(0, 50).map(h => `<tr>
-            <td>${h.bssid || ''}</td>
-            <td>${h.station_mac || ''}</td>
-            <td>${h.kind || ''}</td>
-            <td>${h.quality || ''}</td>
-            <td>${h.created_at || ''}</td>
+            <td>${esc(h.bssid)}</td>
+            <td>${esc(h.station_mac)}</td>
+            <td>${esc(h.kind)}</td>
+            <td>${esc(h.quality)}</td>
+            <td>${esc(h.created_at)}</td>
         </tr>`).join('');
     }
 }
@@ -188,6 +229,8 @@ function log(msg) {
     el.textContent += `[${ts}] ${msg}\n`;
     el.scrollTop = el.scrollHeight;
 }
+
+document.getElementById('api-token').value = loadToken();
 
 // Auto-refresh every 3 seconds
 refresh();

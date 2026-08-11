@@ -185,13 +185,13 @@ def build_html_report(
         )
         for loc in gps_locations:
             bssid = loc.get("bssid")
-            essid = loc.get("essid")
-            if essid is None:
-                essid = essid_by_bssid.get(bssid)
+            gps_essid = loc.get("essid")
+            if gps_essid is None:
+                gps_essid = essid_by_bssid.get(bssid)
             parts.append(
                 "<tr>"
                 f"<td>{_cell(bssid)}</td>"
-                f"<td>{_cell(essid)}</td>"
+                f"<td>{_cell(gps_essid)}</td>"
                 f"<td>{_cell(loc.get('latitude'))}</td>"
                 f"<td>{_cell(loc.get('longitude'))}</td>"
                 f"<td>{_cell(loc.get('signal'))}</td>"

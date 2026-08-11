@@ -9,7 +9,15 @@ from __future__ import annotations
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Type
+
+if TYPE_CHECKING:
+    # Type-only: these modules import scapy at module scope, which the
+    # plugin registry itself must stay importable without (see the lazy
+    # imports inside each plugin's start()).
+    from .crack import CrackService
+    from .deauth import DeauthService
+    from .wps_attack import WpsAttackService
 
 
 @dataclass
@@ -123,7 +131,7 @@ class DeauthAttackPlugin(AttackPlugin):
     """Deauthentication attack plugin."""
 
     def __init__(self) -> None:
-        self._service = None
+        self._service: Optional["DeauthService"] = None
 
     @property
     def name(self) -> str:
@@ -163,7 +171,7 @@ class WpsAttackPlugin(AttackPlugin):
     """WPS PIN attack plugin (reaver/bully)."""
 
     def __init__(self) -> None:
-        self._service = None
+        self._service: Optional["WpsAttackService"] = None
 
     @property
     def name(self) -> str:
@@ -245,7 +253,7 @@ class CrackPlugin(AttackPlugin):
     """Dictionary cracking via aircrack-ng."""
 
     def __init__(self) -> None:
-        self._service = None
+        self._service: Optional["CrackService"] = None
 
     @property
     def name(self) -> str:

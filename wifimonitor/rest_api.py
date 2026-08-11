@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlparse
@@ -17,6 +17,14 @@ from urllib.parse import parse_qs, urlparse
 from .auth import check_token
 from .plugins import registry
 from .usecases import MonitorUseCase
+
+# POST bodies are tiny JSON control messages; refuse anything absurdly large
+# instead of buffering an attacker-supplied Content-Length into memory.
+_MAX_BODY_BYTES = 1_048_576  # 1 MiB
+
+
+class BodyTooLarge(Exception):
+    pass
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -63,6 +71,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         if length == 0:
             return {}
+        if length > _MAX_BODY_BYTES:
+            raise BodyTooLarge(f"request body of {length} bytes exceeds the {_MAX_BODY_BYTES}-byte limit")
         raw = self.rfile.read(length)
         return json.loads(raw)
 
@@ -71,10 +81,18 @@ class ApiHandler(BaseHTTPRequestHandler):
         if not uc:
             self._error(503, "Not initialized")
             return
-        if not self._authorized():
-            return
 
         path = urlparse(self.path).path.rstrip("/")
+
+        # The dashboard shell carries no data of its own (it fetches everything
+        # from the JSON endpoints below), so it's served without a token; every
+        # endpoint it calls still enforces auth.
+        if path == "" or path == "/" or path == "/index.html":
+            self._serve_web_ui()
+            return
+
+        if not self._authorized():
+            return
 
         if path == "/api/plugins":
             self._json_response(registry.list_plugins())
@@ -115,8 +133,6 @@ class ApiHandler(BaseHTTPRequestHandler):
         elif path == "/api/sessions":
             rows = [dict(r) for r in uc.db.fetch_sessions()]
             self._json_response(rows)
-        elif path == "" or path == "/" or path == "/index.html":
-            self._serve_web_ui()
         else:
             self._error(404, f"Not found: {path}")
 
@@ -165,6 +181,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._json_response({"status": "auto_attack_stopped"})
             else:
                 self._error(404, f"Not found: {path}")
+        except BodyTooLarge as exc:
+            self._error(413, str(exc))
         except Exception as exc:  # noqa: BLE001
             self._error(400, str(exc))
 
@@ -183,7 +201,7 @@ class RestApiServer:
         self._host = host
         self._port = port
         self._token = token
-        self._server: Optional[HTTPServer] = None
+        self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
@@ -194,7 +212,8 @@ class RestApiServer:
                 "REST API слушает %s без токена — доступ к управлению и данным открыт всем в сети",
                 self._host,
             )
-        self._server = HTTPServer((self._host, self._port), ApiHandler)
+        self._server = ThreadingHTTPServer((self._host, self._port), ApiHandler)
+        self._server.daemon_threads = True
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 

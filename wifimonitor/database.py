@@ -279,6 +279,7 @@ class DatabaseManager:
                     "INSERT INTO sessions (started_at, interface, notes) VALUES (?, ?, ?)",
                     (utcnow().isoformat(), interface, notes),
                 )
+                assert cursor.lastrowid is not None  # always set after a plain INSERT
                 return cursor.lastrowid
 
     def end_session(self, session_id: int) -> None:

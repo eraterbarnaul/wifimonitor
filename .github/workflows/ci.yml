@@ -43,8 +43,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ruff
+          pip install -e ".[dev]"
 
       - name: Lint with ruff
         run: |
           ruff check wifimonitor/ tests/
+
+      - name: Type-check with mypy
+        run: |
+          mypy wifimonitor/

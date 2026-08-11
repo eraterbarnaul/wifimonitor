@@ -32,7 +32,9 @@ class HashcatExporter:
             if not (src and dst and ap):
                 continue
             station = dst if src == ap else src
-            groups[(ap, station)].append((src, dst, ap, bytes(pkt.getlayer(EAPOL))))
+            eapol_layer = pkt.getlayer(EAPOL)
+            assert eapol_layer is not None  # guaranteed by the haslayer(EAPOL) check above
+            groups[(ap, station)].append((src, dst, ap, bytes(eapol_layer)))
 
         lines: List[str] = []
         for frames in groups.values():

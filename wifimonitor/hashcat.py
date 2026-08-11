@@ -203,6 +203,7 @@ def build_hash_lines(
             anonce = None
             messagepair = None
         if anonce is not None:
+            assert messagepair is not None  # set together with anonce above
             lines.append(
                 eapol_line(m2.mic, ap_mac, sta_mac, essid, anonce, m2.eapol_zeroed, messagepair)
             )

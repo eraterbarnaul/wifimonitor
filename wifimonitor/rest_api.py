@@ -7,22 +7,50 @@ dependency. For production use, consider wrapping with a proper ASGI framework.
 from __future__ import annotations
 
 import json
+import logging
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
+from .auth import RateLimiter, check_token
+from .plugins import registry
 from .usecases import MonitorUseCase
+
+# POST bodies are tiny JSON control messages; refuse anything absurdly large
+# instead of buffering an attacker-supplied Content-Length into memory.
+_MAX_BODY_BYTES = 1_048_576  # 1 MiB
+
+
+class BodyTooLarge(Exception):
+    pass
 
 
 class ApiHandler(BaseHTTPRequestHandler):
     """HTTP request handler for the REST API."""
 
     use_case: Optional[MonitorUseCase] = None
+    auth_token: str = ""  # when set, requests must present it
+    rate_limiter: RateLimiter = RateLimiter()
 
     def log_message(self, format, *args):
         pass  # Suppress default logging
+
+    def _authorized(self) -> bool:
+        client_ip = self.client_address[0]
+        if self.auth_token and self.rate_limiter.is_blocked(client_ip):
+            self._error(429, "Too many failed attempts — try again later")
+            return False
+        query_token = (parse_qs(urlparse(self.path).query).get("token") or [""])[0]
+        if check_token(self.auth_token, self.headers.get("Authorization", ""), query_token):
+            if self.auth_token:
+                self.rate_limiter.record_success(client_ip)
+            return True
+        if self.auth_token:
+            self.rate_limiter.record_failure(client_ip)
+        self._error(401, "Unauthorized")
+        return False
 
     def _json_response(self, data: Any, status: int = 200) -> None:
         body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
@@ -52,6 +80,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         if length == 0:
             return {}
+        if length > _MAX_BODY_BYTES:
+            raise BodyTooLarge(f"request body of {length} bytes exceeds the {_MAX_BODY_BYTES}-byte limit")
         raw = self.rfile.read(length)
         return json.loads(raw)
 
@@ -63,6 +93,19 @@ class ApiHandler(BaseHTTPRequestHandler):
 
         path = urlparse(self.path).path.rstrip("/")
 
+        # The dashboard shell carries no data of its own (it fetches everything
+        # from the JSON endpoints below), so it's served without a token; every
+        # endpoint it calls still enforces auth.
+        if path == "" or path == "/" or path == "/index.html":
+            self._serve_web_ui()
+            return
+
+        if not self._authorized():
+            return
+
+        if path == "/api/plugins":
+            self._json_response(registry.list_plugins())
+            return
         if path == "/api/status":
             self._json_response({
                 "interface": uc.current_interface,
@@ -99,8 +142,6 @@ class ApiHandler(BaseHTTPRequestHandler):
         elif path == "/api/sessions":
             rows = [dict(r) for r in uc.db.fetch_sessions()]
             self._json_response(rows)
-        elif path == "" or path == "/" or path == "/index.html":
-            self._serve_web_ui()
         else:
             self._error(404, f"Not found: {path}")
 
@@ -108,6 +149,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         uc = self.use_case
         if not uc:
             self._error(503, "Not initialized")
+            return
+        if not self._authorized():
             return
 
         path = urlparse(self.path).path.rstrip("/")
@@ -147,6 +190,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._json_response({"status": "auto_attack_stopped"})
             else:
                 self._error(404, f"Not found: {path}")
+        except BodyTooLarge as exc:
+            self._error(413, str(exc))
         except Exception as exc:  # noqa: BLE001
             self._error(400, str(exc))
 
@@ -154,16 +199,31 @@ class ApiHandler(BaseHTTPRequestHandler):
 class RestApiServer:
     """Lightweight REST API server for remote monitoring."""
 
-    def __init__(self, use_case: MonitorUseCase, host: str = "0.0.0.0", port: int = 8080) -> None:
+    def __init__(
+        self,
+        use_case: MonitorUseCase,
+        host: str = "127.0.0.1",
+        port: int = 8080,
+        token: str = "",
+    ) -> None:
         self._uc = use_case
         self._host = host
         self._port = port
-        self._server: Optional[HTTPServer] = None
+        self._token = token
+        self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
         ApiHandler.use_case = self._uc
-        self._server = HTTPServer((self._host, self._port), ApiHandler)
+        ApiHandler.auth_token = self._token
+        ApiHandler.rate_limiter = RateLimiter()  # fresh lockout state for this server instance
+        if self._host not in ("127.0.0.1", "localhost", "::1") and not self._token:
+            logging.getLogger("wifimonitor").warning(
+                "REST API слушает %s без токена — доступ к управлению и данным открыт всем в сети",
+                self._host,
+            )
+        self._server = ThreadingHTTPServer((self._host, self._port), ApiHandler)
+        self._server.daemon_threads = True
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 

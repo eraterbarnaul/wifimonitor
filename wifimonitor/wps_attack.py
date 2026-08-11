@@ -7,10 +7,13 @@ Pixie Dust / online PIN attacks are noisy and disruptive.
 
 from __future__ import annotations
 
+import logging
 import re
 import subprocess
 import threading
 from typing import Callable, Dict, List, Optional
+
+log = logging.getLogger("wifimonitor.wps")
 
 _PIN_RE = re.compile(r"WPS PIN:\s*'?([0-9]{4,8})'?")
 _PSK_QUOTED_RE = re.compile(r"WPA PSK:\s*'([^']*)'")
@@ -101,8 +104,8 @@ class WpsAttackService:
         if self._proc and self._proc.poll() is None:
             try:
                 self._proc.terminate()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception:  # noqa: BLE001 - process may already be gone
+                log.debug("terminating the WPS attack process failed", exc_info=True)
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2)
         self._proc = None

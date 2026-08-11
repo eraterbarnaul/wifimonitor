@@ -1,3 +1,4 @@
+import logging
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
@@ -40,6 +41,8 @@ from ..oui import is_randomized_mac, lookup_vendor
 from ..timeutil import as_utc, utcnow
 from .locator import RssiPlot
 from .workers import Worker
+
+log = logging.getLogger("wifimonitor.ui")
 
 # Aware "oldest possible" sentinel so rows without a timestamp sort last.
 _MIN_DT = datetime.min.replace(tzinfo=timezone.utc)
@@ -1064,8 +1067,8 @@ class MainWindow(QMainWindow):
             self._locator_locked_channel = None
             try:
                 self.controller.unlock_monitor_channel()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception:  # noqa: BLE001 - unlock is best-effort cleanup
+                log.debug("unlock_monitor_channel failed", exc_info=True)
 
     def _apply_locator_lock(self) -> None:
         if not self.locator_lock_cb.isChecked():
@@ -1392,8 +1395,8 @@ class MainWindow(QMainWindow):
         self._auto_capture_bssid = None
         try:
             self.controller.stop_deauth()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception:  # noqa: BLE001 - already stopping, ignore
+            log.debug("stop_deauth on auto-capture timeout failed", exc_info=True)
         self.status_bar.showMessage("Авто-захват: handshake не пойман, остановлено", 8000)
 
     def _on_auto_attack_progress(self, phase: str, message: str) -> None:

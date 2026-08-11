@@ -12,7 +12,7 @@ from collections import defaultdict
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, cast
 
 from .auto_attack import AutoAttackPipeline
 from .capture import MonitorService
@@ -177,13 +177,12 @@ class MonitorUseCase:
     def _handle_ssid_reveal(self, bssid: str, ssid: str) -> None:
         with self._state_lock:
             ap = self.access_points.get(bssid)
-            reveal = ap is not None and not ap.essid
-            if reveal:
-                ap.essid = ssid
-        if reveal:
-            self.db.upsert_access_point_force(ap)
-            self.bus.emit(Events.ACCESS_POINT_DISCOVERED, asdict(ap))
-            self._log(f"Раскрыт скрытый SSID: {ssid} ({bssid})")
+            if ap is None or ap.essid:
+                return
+            ap.essid = ssid
+        self.db.upsert_access_point_force(ap)
+        self.bus.emit(Events.ACCESS_POINT_DISCOVERED, asdict(ap))
+        self._log(f"Раскрыт скрытый SSID: {ssid} ({bssid})")
 
     def export_hashcat(self, capture_path: Path, output_path: Path, tool_path: Optional[str] = None) -> None:
         if tool_path:
@@ -201,6 +200,13 @@ class MonitorUseCase:
         access_points = [dict(row) for row in self.db.fetch_access_points()]
         stations = [dict(row) for row in self.db.fetch_stations()]
         return self.csv_exporter.export(output_path, access_points, stations)
+
+    def export_wigle(self, output_path: Path) -> Path:
+        """Export GPS-tagged access points to WiGLE CSV for wardriving upload."""
+        from .wardriving import export_wigle
+        locations = [dict(row) for row in self.db.fetch_ap_locations()]
+        ap_index = {row["bssid"]: dict(row) for row in self.db.fetch_access_points()}
+        return export_wigle(output_path, locations, ap_index)
 
     def export_report(self, output_path: Path) -> None:
         from .detect import find_evil_twins
@@ -346,7 +352,7 @@ class MonitorUseCase:
         for row in rows:
             last_seen = row.get("last_seen")
             ap = AccessPoint(
-                bssid=row.get("bssid"),
+                bssid=row["bssid"],  # NOT NULL primary key: a missing value means a corrupt row
                 essid=row.get("essid"),
                 channel=row.get("channel"),
                 encryption=row.get("encryption"),
@@ -355,7 +361,9 @@ class MonitorUseCase:
                 mfp_required=bool(row.get("mfp_required")),
                 bandwidth=row.get("bandwidth") or "",
                 wifi_generation=row.get("wifi_generation") or "",
-                last_seen=as_utc(datetime.fromisoformat(last_seen)) if last_seen else utcnow(),
+                last_seen=(
+                    cast(datetime, as_utc(datetime.fromisoformat(last_seen))) if last_seen else utcnow()
+                ),
             )
             with self._state_lock:
                 self.access_points[ap.bssid] = ap

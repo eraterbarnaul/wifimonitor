@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0,<9", "ruff>=0.4,<1", "mypy>=1.10,<2", "PyQt5-stubs>=5.15,<6"]
+dev = ["pytest>=7.0,<9", "ruff>=0.4,<1", "mypy>=1.10,<3", "PyQt5-stubs>=5.15,<6"]
 
 [project.scripts]
 wifimonitor = "wifimonitor.app:main"

@@ -17,7 +17,7 @@ pytest==8.4.2
 iniconfig==2.3.0
 pluggy==1.6.0
 Pygments==2.20.0
-ruff==0.16.2
+ruff==0.16.6
 mypy==1.20.2
 mypy_extensions==1.1.0
 librt==0.15.0
